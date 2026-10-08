@@ -1,14 +1,19 @@
 services:
   iptv-speedtest:
-    build: https://github.com/zknjjjx/iptv.git#main:speedtest
+    image: python:3.12-alpine     # 直接用官方 Python 镜像，无需构建（不依赖 git / buildx）
     container_name: iptv-speedtest
     restart: unless-stopped
-    network_mode: host        # 用宿主机网络测速，结果最真实；端口即 PORT
+    network_mode: host            # 用宿主机网络测速，结果最真实；端口即 PORT
+    working_dir: /app
+    command: python -u /app/app.py
     environment:
+      - TZ=Asia/Shanghai
       - SOURCES=https://raw.githubusercontent.com/zknjjjx/iptv/main/iptv.m3u
-      - INTERVAL_HOURS=12     # 每 12 小时重测
-      - KEEP=1                # 每频道保留 1 条
-      - WORKERS=32            # 并发数，软路由性能弱可改 16
+      - INTERVAL_HOURS=12         # 首次启动的默认值，之后在网页里改
+      - KEEP=1
+      - WORKERS=32                # 软路由性能弱可改 16
       - PORT=8899
+      # - ADMIN_PASSWORD=改成你的密码
     volumes:
+      - ./app.py:/app/app.py:ro
       - ./data:/data
