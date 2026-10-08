@@ -38,7 +38,9 @@ DEFAULT_CFG = {
     "keep": int(os.getenv("KEEP", "1")),
     "workers": int(os.getenv("WORKERS", "32")),
     "timeout": float(os.getenv("TIMEOUT", "8")),
-    "smooth_ratio": 1.2,
+    "smooth_ratio": 1.2,            # 实时倍率 ≥ 此值算流畅
+    "drop_ratio": 0.5,              # 实时倍率 < 此值剔除，两者之间算勉强（保留但排后）
+    "retest_workers": 4,            # 复测并发
     "min_kbps": 0,
     "min_height": 0,                # 最低分辨率（高度），0 = 不限
     "keep_unknown_res": True,       # 测不出分辨率的是否保留
@@ -151,15 +153,18 @@ def fetch_info(url, timeout, limit=None, max_time=None):
     t = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
         final, ctype = r.geturl(), (r.headers.get("Content-Type") or "").lower()
-        buf = bytearray()
+        buf, t1 = bytearray(), None
         while True:
             chunk = r.read(65536)
             if not chunk:
                 break
+            if t1 is None:
+                t1 = time.time()          # 首包到达，之后才开始算播放速度
             buf += chunk
-            if (limit and len(buf) >= limit) or time.time() - t > (max_time or timeout * 3):
+            if (limit and len(buf) >= limit) or time.time() - (t1 or t) > (max_time or timeout * 3):
                 break
-    return bytes(buf), max(time.time() - t, 0.001), final, ctype
+    t1 = t1 or time.time()
+    return bytes(buf), max(time.time() - t1, 0.001), final, ctype, t1 - t
 
 
 def media_duration(data):
@@ -483,9 +488,10 @@ def err_text(e):
     return t[:60] or type(e).__name__
 
 
-def rtsp_probe(url, cfg, seconds=4):
+def rtsp_probe(url, cfg, seconds=6):
     """RTSP：DESCRIBE -> SETUP(TCP 交织) -> PLAY，接收几秒数据算码率；支持 301/302 跳转"""
     to = min(cfg["timeout"], 8)
+    tstart = time.time()
     for _ in range(4):
         p = urlparse(url)
         sock = socket.create_connection((p.hostname, p.port or 554), timeout=to)
@@ -553,6 +559,7 @@ def rtsp_probe(url, cfg, seconds=4):
             if code != 200:
                 return F(f"RTSP PLAY 返回 {code}")
             got, t0 = len(buf), time.time()
+            ttfb = round(t0 - tstart, 2)
             keep = bytearray(buf)
             while time.time() - t0 < seconds and not stop_evt.is_set():
                 sock.settimeout(max(0.5, min(to, seconds - (time.time() - t0))))
@@ -574,16 +581,16 @@ def rtsp_probe(url, cfg, seconds=4):
                 return F(f"数据太少 {got // 1024}KB")
             measured = got * 8 / dt / 1000
             br = as_kbps or measured
-            # 实时流下载速度≈码率；收得上来就视为流畅
-            speed = measured * cfg["smooth_ratio"] * 1.01 if measured >= br * 0.85 else measured
-            return {"bitrate": br, "speed": speed, "res": detect_res(rtp_payload(bytes(keep)), sdp)}
+            # 服务器按实时推流：收到速度 / 标称码率 ≈ 1 就是跟得上（留 10% 余量给码率波动）
+            rt = min(measured / br / 0.9, 3.0) if as_kbps else None
+            return {"bitrate": br, "rt": rt, "live": True, "ttfb": ttfb, "res": detect_res(rtp_payload(bytes(keep)), sdp)}
         finally:
             sock.close()
     return F("RTSP 跳转次数过多")
 
 
 def probe(url, cfg):
-    u, to, smooth = url.split("$")[0], cfg["timeout"], cfg["smooth_ratio"]
+    u, to = url.split("$")[0], cfg["timeout"]
     try:
         if u.lower().startswith("rtsp://"):
             return rtsp_probe(u, cfg)
@@ -593,7 +600,7 @@ def probe(url, cfg):
         if cfg["skip_vod"] and vod.search(u.lower()):
             return F("点播文件")
         if ".m3u8" not in u.lower():
-            data, dt, final, ctype = fetch_info(u, to, limit=6 * 1024 * 1024, max_time=5)
+            data, dt, final, ctype, ttfb = fetch_info(u, to, limit=8 * 1024 * 1024, max_time=7)
             if data.lstrip()[:7] == b"#EXTM3U":          # 没有 .m3u8 后缀的 HLS
                 text, u = data.decode("utf-8", "ignore"), final
             else:
@@ -602,15 +609,13 @@ def probe(url, cfg):
                     return F("跳转到点播/占位视频")
                 if len(data) < 100 * 1024:
                     return F(f"数据太少 {len(data) // 1024}KB")
-                sp = len(data) * 8 / dt / 1000
                 md = media_duration(data)
                 if md:
-                    br = len(data) * 8 / md / 1000
-                    # 直播流服务器按实时速度推送：收到的内容时长跟得上墙钟时间就算流畅
-                    speed = br * smooth * 1.01 if md >= dt * 0.9 else br * md / dt
+                    # 直播流按实时推送：从首包起，收到的播放时长 / 用掉的时间 ≈ 1 就是跟得上（留 10% 余量）
+                    br, rt = len(data) * 8 / md / 1000, min(md / dt / 0.9, 3.0)
                 else:
-                    br, speed = sp, sp * smooth
-                return {"bitrate": br, "speed": speed, "res": detect_res(data[:3 * 1024 * 1024])}
+                    br, rt = len(data) * 8 / dt / 1000, None   # 算不出时长：不判流畅度
+                return {"bitrate": br, "rt": rt, "live": True, "ttfb": round(ttfb, 2), "res": detect_res(data[:3 * 1024 * 1024])}
         else:
             text = fetch(u, to)[0].decode("utf-8", "ignore")
         res = ""
@@ -629,13 +634,26 @@ def probe(url, cfg):
         segs = re.findall(r"#EXTINF:\s*([\d.]+)[^\n]*\n\s*([^\n#]+)", text)
         if not segs:
             return F("m3u8 没有分片")
-        dur, seg = segs[-2] if len(segs) > 1 else segs[0]
-        dur = float(dur) or 1.0
-        data, dt = fetch(urljoin(u, seg.strip()), to, limit=MAX_SEG)
-        if len(data) < 10 * 1024:
-            return F("分片太小")
-        return {"bitrate": len(data) * 8 / dur / 1000, "speed": len(data) * 8 / dt / 1000,
-                "res": res or detect_res(data[:3 * 1024 * 1024])}
+        # 连测最近 3 个分片：第 1 个热身（CDN 回源、TCP 起步），后面的算实时倍率 = 分片时长 / 下载用时
+        picks = segs[-4:-1] if len(segs) >= 4 else segs[-3:]
+        nbytes = ndur = 0.0
+        rts, ttfb, first = [], None, b""
+        for i, (dur, seg) in enumerate(picks):
+            if stop_evt.is_set():
+                break
+            dur = float(dur) or 1.0
+            data, dt, _, _, tf = fetch_info(urljoin(u, seg.strip()), to, limit=MAX_SEG)
+            if i == 0:
+                if len(data) < 10 * 1024:
+                    return F("分片太小")
+                ttfb, first = round(tf, 2), data
+            nbytes += len(data)
+            ndur += dur
+            if i > 0 or len(picks) == 1:
+                rts.append((dur, dt + tf))
+        rt = sum(d for d, _ in rts) / max(sum(t for _, t in rts), 0.001) if rts else None
+        return {"bitrate": nbytes * 8 / ndur / 1000, "rt": min(rt, 50.0) if rt else None, "ttfb": ttfb,
+                "res": res or detect_res(first[:3 * 1024 * 1024])}
     except Exception as e:
         return F(err_text(e))
 
@@ -652,6 +670,25 @@ def res_fail(r, cfg):
     if min(w, h) < mh:
         return f"分辨率过低 {w}x{h}"
     return None
+
+
+def judge(r, cfg):
+    """返回 (等级, 原因)：ok 流畅 / weak 勉强（保留但排后）/ bad 剔除"""
+    if not r or "fail" in r:
+        return "bad", (r or {}).get("fail", "未测")
+    if r["bitrate"] < cfg["min_kbps"]:
+        return "bad", f"码率过低 {round(r['bitrate'])}kbps"
+    rf = res_fail(r, cfg)
+    if rf:
+        return "bad", rf
+    rt = r.get("rt")
+    # 直连/RTSP 是服务器按实时推送，倍率最多≈1，跟得上（≥1）就算流畅，不受流畅倍率影响
+    if rt is None or rt >= cfg["smooth_ratio"] or (r.get("live") and rt >= 1.0):
+        return "ok", ""
+    detail = f"倍率{rt:.2f} 首包{r.get('ttfb') or 0}s 测{r.get('tries', 1)}次"
+    if rt < cfg.get("drop_ratio", 0.5):
+        return "bad", "不流畅 " + detail
+    return "weak", "勉强 " + detail
 
 
 def run_once():
@@ -707,7 +744,7 @@ def run_once():
             results[i] = r
             state["progress"] += 1
             stats[entries[i][4]]["tested"] += 1
-            if r and "fail" not in r and r["bitrate"] >= cfg["min_kbps"] and not res_fail(r, cfg) and r["speed"] >= r["bitrate"] * cfg["smooth_ratio"]:
+            if judge(r, cfg)[0] != "bad":
                 stats[entries[i][4]]["alive"] += 1
     ex = ThreadPoolExecutor(max(1, int(cfg["workers"])))
     futs = [ex.submit(work, i) for i in range(len(entries))]
@@ -719,22 +756,40 @@ def run_once():
         log("测速已手动停止，保留上次结果")
         return
 
+    # 第二轮：不流畅/勉强的低并发复测，取更好的一次
+    redo = [i for i, r in enumerate(results) if r and "fail" not in r and judge(r, cfg)[0] != "ok"]
+    if redo:
+        state.update(status=f"复测 {len(redo)} 条", progress=0, total=len(redo))
+        log(f"复测不流畅的 {len(redo)} 条，并发 {cfg['retest_workers']}")
+        def rework(i):
+            if stop_evt.is_set() or my != RUN_ID:
+                return
+            r2 = probe(entries[i][3], cfg)
+            old = results[i]
+            before = judge(old, cfg)[0]
+            if r2 and "fail" not in r2 and (r2.get("rt") or 0) > (old.get("rt") or 0):
+                results[i] = r2
+            results[i]["tries"] = 2
+            if before == "bad" and judge(results[i], cfg)[0] != "bad":
+                stats[entries[i][4]]["alive"] += 1
+            state["progress"] += 1
+        ex = ThreadPoolExecutor(max(1, int(cfg["retest_workers"])))
+        futs = [ex.submit(rework, i) for i in redo]
+        while not stop_evt.is_set() and not all(f.done() for f in futs):
+            time.sleep(0.5)
+        ex.shutdown(wait=not stop_evt.is_set(), cancel_futures=True)
+        if stop_evt.is_set():
+            state.update(status="已停止")
+            log("测速已手动停止，保留上次结果")
+            return
+
     best, order, failed = {}, [], []
     for (name, g, logo, url, src), r in zip(entries, results):
-        if not r or "fail" in r:
-            failed.append({"group": g, "name": name, "url": url, "src": src, "reason": (r or {}).get("fail", "未测")})
+        lvl, why = judge(r, cfg)
+        if lvl == "bad":
+            failed.append({"group": g, "name": name, "url": url, "src": src, "reason": why})
             continue
-        if r["bitrate"] < cfg["min_kbps"]:
-            failed.append({"group": g, "name": name, "url": url, "src": src, "reason": f"码率过低 {round(r['bitrate'])}kbps"})
-            continue
-        rf = res_fail(r, cfg)
-        if rf:
-            failed.append({"group": g, "name": name, "url": url, "src": src, "reason": rf})
-            continue
-        if r["speed"] < r["bitrate"] * cfg["smooth_ratio"]:
-            failed.append({"group": g, "name": name, "url": url, "src": src,
-                           "reason": f"不流畅 速度{round(r['speed'] / 1000, 1)}/码率{round(r['bitrate'] / 1000, 1)}Mbps"})
-            continue
+        r["weak"] = lvl == "weak"
         k = norm(name, cfg["merge_names"])
         if k not in best:
             best[k] = []
@@ -746,7 +801,8 @@ def run_once():
     rule_order = [r["group"] for r in cfg["group_rules"]] if cfg["group_mode"] == "rules" else []
     groups = {g: [] for g in rule_order}
     for k in order:
-        picks = sorted(best[k], key=lambda x: -x[0])[:max(1, int(cfg["keep"]))]
+        # 流畅的优先，其次按码率；只剩勉强的源时也保留，频道不至于消失
+        picks = sorted(best[k], key=lambda x: (x[5]["weak"], -x[0]))[:max(1, int(cfg["keep"]))]
         name = picks[0][1]
         groups.setdefault(pick_group(name, picks[0][2], cfg), []).extend(picks)
 
@@ -761,7 +817,8 @@ def run_once():
             m3u += [f'#EXTINF:-1 tvg-name="{name}"{la} group-title="{g}",{name}', url.split("$")[0]]
             txt.append(f"{name},{url}")
             report.append({"group": g, "name": name, "url": url, "kbps": round(br),
-                           "speed_kbps": round(r["speed"]), "res": r["res"]})
+                           "rt": round(r["rt"], 2) if r.get("rt") else None, "ttfb": r.get("ttfb"),
+                           "weak": r["weak"], "res": r["res"]})
         txt.append("")
     for fn, body in (("best.m3u", "\n".join(m3u) + "\n"), ("best.txt", "\n".join(txt)),
                      ("report.json", json.dumps(report, ensure_ascii=False)),
@@ -810,11 +867,11 @@ def scheduler():
 def clean_cfg(new):
     c = json.loads(json.dumps(CFG))
     num = {"interval_hours": (0, 168), "keep": (1, 20), "workers": (1, 256),
-           "timeout": (2, 60), "smooth_ratio": (0, 5), "min_kbps": (0, 100000), "min_height": (0, 4320)}
+           "timeout": (2, 60), "smooth_ratio": (0, 5), "drop_ratio": (0, 5), "retest_workers": (1, 32), "min_kbps": (0, 100000), "min_height": (0, 4320)}
     for k, (lo, hi) in num.items():
         if k in new:
             v = float(new[k])
-            c[k] = int(v) if k in ("keep", "workers", "min_height") else v
+            c[k] = int(v) if k in ("keep", "workers", "min_height", "retest_workers") else v
             c[k] = min(max(c[k], lo), hi)
     for k in ("group_mode", "unmatched_group", "blacklist", "ip_version", "epg_url"):
         if k in new:
@@ -987,7 +1044,9 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
   <div class=row><label>每频道保留条数</label><input type=number id=keep min=1 max=20></div>
   <div class=row><label>并发数</label><input type=number id=workers min=1 max=256><span class=muted>软路由弱就调低</span></div>
   <div class=row><label>超时（秒）</label><input type=number id=timeout min=2 max=60></div>
-  <div class=row><label>流畅系数</label><input type=number id=smooth_ratio step=0.1 min=0><span class=muted>下载速度 ≥ 码率×此值才保留</span></div>
+  <div class=row><label>流畅倍率</label><input type=number id=smooth_ratio step=0.1 min=0><span class=muted>实时倍率 ≥ 此值算流畅</span></div>
+  <div class=row><label>剔除倍率</label><input type=number id=drop_ratio step=0.1 min=0><span class=muted>低于此值剔除，之间的保留但排后</span></div>
+  <div class=row><label>复测并发</label><input type=number id=retest_workers min=1><span class=muted>不流畅的再测一遍</span></div>
   <div class=row><label>最低码率 kbps</label><input type=number id=min_kbps min=0><span class=muted>如 2000 ≈ 只要高清</span></div>
   <div class=row><label>最低分辨率</label><select id=min_height><option value=0>不限</option><option value=576>576p（标清）</option><option value=720>720p</option><option value=1080>1080p</option><option value=2160>4K</option></select><span class=muted>低于此分辨率的剔除</span></div>
   <div class=row><label>分辨率未知时保留</label><input type=checkbox id=keep_unknown_res><span class=muted>有些源测不出分辨率，关掉就一并剔除</span></div></div>
@@ -1020,7 +1079,7 @@ async function api(p,body){const r=await fetch(p,body===undefined?{}:{method:'PO
 document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{tab=a.dataset.t;document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('on',x==a));
  document.querySelectorAll('main section').forEach(s=>s.hidden=s.id!=tab);$('savebar').hidden=!['sources','groups','options'].includes(tab);if(tab=='result')loadResult()});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const F=['interval_hours','keep','workers','timeout','smooth_ratio','min_kbps','min_height','ip_version','blacklist','epg_url','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start','keep_unknown_res'];
+const F=['interval_hours','keep','workers','timeout','smooth_ratio','drop_ratio','retest_workers','min_kbps','min_height','ip_version','blacklist','epg_url','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start','keep_unknown_res'];
 async function load(){cfg=await api('/api/config');F.forEach(k=>$(k).value=cfg[k]);B.forEach(k=>$(k).checked=cfg[k]);drawSrc();drawRules()}
 function collect(){F.forEach(k=>cfg[k]=$(k).value);B.forEach(k=>cfg[k]=$(k).checked)}
 async function save(){collect();const r=await api('/api/config',cfg);if(r.ok){cfg=r.config;toast('已保存，下次测速生效');drawSrc();drawRules()}else toast(r.error)}
@@ -1062,8 +1121,8 @@ function drawResult(){const f=$('rf').value.trim().toUpperCase();
  $('vok').className=view=='ok'?'':'gray';$('vbad').className=view=='bad'?'':'gray';$('rr').hidden=$('rexp').hidden=view!='bad';
  $('rc').textContent=`成功 ${report.length} 条，失败 ${failed.length} 条`;
  if(view=='ok'){const rows=report.filter(r=>!f||r.name.toUpperCase().includes(f)||r.url.toUpperCase().includes(f));
-  $('rt').innerHTML='<tr><th>分组</th><th>频道</th><th>码率</th><th>分辨率</th></tr>'+rows.slice(0,500).map(r=>
-  `<tr><td>${esc(r.group)}</td><td><a href="${esc(r.url)}" target=_blank>${esc(r.name)}</a></td><td>${(r.kbps/1000).toFixed(1)} Mbps</td><td>${esc(r.res)||'-'}</td></tr>`).join('');
+  $('rt').innerHTML='<tr><th>分组</th><th>频道</th><th>码率</th><th>分辨率</th><th>实时倍率</th><th>首包</th></tr>'+rows.slice(0,500).map(r=>
+  `<tr><td>${esc(r.group)}</td><td><a href="${esc(r.url)}" target=_blank>${esc(r.name)}</a></td><td>${(r.kbps/1000).toFixed(1)} Mbps</td><td>${esc(r.res)||'-'}</td><td${r.weak?' class=bad title=勉强':''}>${r.rt==null?'-':r.rt+(r.weak?' 勉强':'')}</td><td>${r.ttfb==null?'-':r.ttfb+'s'}</td></tr>`).join('');
   $('rmore').textContent=rows.length>500?`只显示前 500 条，共 ${rows.length} 条，可搜索缩小范围`:'';return}
  const rows=failRows();
  $('rt').innerHTML='<tr><th>频道</th><th>原因</th><th>链接</th></tr>'+rows.slice(0,500).map(x=>
