@@ -12,6 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urljoin, urlparse
 
+# alpine 镜像没有时区数据库，TZ=Asia/Shanghai 会被当成 UTC；换成等价的 POSIX 写法
+_tz = os.environ.get("TZ") or "Asia/Shanghai"
+if "/" in _tz and not os.path.exists("/usr/share/zoneinfo/" + _tz):
+    os.environ["TZ"] = {"Asia/Hong_Kong": "HKT-8", "Asia/Tokyo": "JST-9"}.get(_tz, "CST-8")
+    time.tzset()
+
 PORT = int(os.getenv("PORT", "8080"))
 DATA = os.getenv("DATA_DIR", "/data")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "")
@@ -36,6 +42,7 @@ DEFAULT_CFG = {
     "unmatched_group": "地方频道",   # 规则都没匹配上的频道放这里；留空 = 用源里的原始分组
     "blacklist": "购物,测试,广告",   # 频道名或链接含这些词就丢弃
     "interval_hours": float(os.getenv("INTERVAL_HOURS", "12")),
+    "start_time": os.getenv("START_TIME", ""),   # 每天几点开始（HH:MM），以此为基准按间隔重复；留空 = 从上次运行起算
     "keep": int(os.getenv("KEEP", "1")),
     "workers": int(os.getenv("WORKERS", "32")),
     "timeout": float(os.getenv("TIMEOUT", "8")),
@@ -861,8 +868,32 @@ def do_run():
         stop_evt.clear()
 
 
+def next_slot(now, start, iv):
+    """以每天 start（HH:MM）为基准、每 iv 小时一次，返回 now 之后最近的运行时刻"""
+    h, m = map(int, start.split(":"))
+    lt = time.localtime(now)
+    day0 = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, h, m, 0, 0, 0, -1))
+    if iv <= 0 or iv >= 24:
+        step = 24 if iv <= 0 else iv
+        if iv > 24:   # 超过一天：从固定日期起按间隔推
+            ref = time.mktime((2026, 1, 1, h, m, 0, 0, 0, -1))
+            k = int((now - ref) // (step * 3600)) + 1
+            return ref + k * step * 3600
+        return day0 + 86400 if day0 <= now else day0
+    # 一天内：start, start+iv, ... 到第二天 start 为止，每天重新对齐
+    best = None
+    for d in (-86400, 0, 86400):
+        t = day0 + d
+        while t < day0 + d + 86400 - 1:
+            if t > now and (best is None or t < best):
+                best = t
+            t += iv * 3600
+    return best
+
+
 def scheduler():
     base = time.time()
+    sched_key = None
     if CFG.get("run_on_start"):
         do_run()
         base = time.time()
@@ -870,8 +901,17 @@ def scheduler():
         log("等待定时或手动触发测速（可在网页“选项”里开启启动即测速）")
     while True:
         iv = float(CFG.get("interval_hours") or 0)
-        last = max(state.get("last_ts") or 0, base)
-        nxt = last + iv * 3600 if iv > 0 else None
+        st = (CFG.get("start_time") or "").strip()
+        if (st, iv) != sched_key:      # 改了计划：从现在起算，不补跑已过去的时刻
+            if sched_key is not None and st:
+                base = time.time()
+            sched_key = (st, iv)
+        if st:
+            # 只在跨过某个计划时刻时触发：取 base 之后的第一个时刻
+            nxt = next_slot(base, st, iv)
+        else:
+            last = max(state.get("last_ts") or 0, base)
+            nxt = last + iv * 3600 if iv > 0 else None
         state["next_run"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(nxt)) if nxt else None
         if refresh_evt.wait(2):
             refresh_evt.clear()
@@ -891,6 +931,10 @@ def clean_cfg(new):
             v = float(new[k])
             c[k] = int(v) if k in ("keep", "workers", "min_height", "retest_workers") else v
             c[k] = min(max(c[k], lo), hi)
+    if "start_time" in new:
+        v = str(new["start_time"]).strip()
+        m = re.fullmatch(r"(\d{1,2})[:：](\d{2})", v)
+        c["start_time"] = f"{int(m.group(1)):02d}:{m.group(2)}" if m and int(m.group(1)) < 24 and int(m.group(2)) < 60 else ""
     for k in ("group_mode", "unmatched_group", "blacklist", "ip_version", "epg_url", "proxy"):
         if k in new:
             c[k] = str(new[k]).strip()
@@ -1064,7 +1108,8 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
 <section id=options hidden>
  <div class=card><h3>测速</h3>
   <div class=row><label>启动即测速</label><input type=checkbox id=run_on_start><span class=muted>关闭 = 容器启动后不测，等到点或手动</span></div>
-  <div class=row><label>重测间隔（小时）</label><input type=number id=interval_hours step=1 min=0><span class=muted>0 = 只手动</span></div>
+  <div class=row><label>每天开始时间</label><input type=time id=start_time><span class=muted>留空 = 从上次运行起算</span></div>
+  <div class=row><label>重测间隔（小时）</label><input type=number id=interval_hours step=1 min=0><span class=muted>如 3:00 + 6 = 每天 3、9、15、21 点；有开始时间时 0 = 每天一次，否则 0 = 只手动</span></div>
   <div class=row><label>每频道保留条数</label><input type=number id=keep min=1 max=20></div>
   <div class=row><label>并发数</label><input type=number id=workers min=1 max=256><span class=muted>软路由弱就调低</span></div>
   <div class=row><label>超时（秒）</label><input type=number id=timeout min=2 max=60></div>
@@ -1103,7 +1148,7 @@ async function api(p,body){const r=await fetch(p,body===undefined?{}:{method:'PO
 document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{tab=a.dataset.t;document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('on',x==a));
  document.querySelectorAll('main section').forEach(s=>s.hidden=s.id!=tab);$('savebar').hidden=!['sources','groups','options'].includes(tab);if(tab=='result')loadResult()});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const F=['interval_hours','keep','workers','timeout','smooth_ratio','drop_ratio','retest_workers','min_kbps','min_height','ip_version','blacklist','epg_url','proxy','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start','keep_unknown_res'];
+const F=['start_time','interval_hours','keep','workers','timeout','smooth_ratio','drop_ratio','retest_workers','min_kbps','min_height','ip_version','blacklist','epg_url','proxy','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start','keep_unknown_res'];
 async function load(){cfg=await api('/api/config');F.forEach(k=>$(k).value=cfg[k]);B.forEach(k=>$(k).checked=cfg[k]);drawSrc();drawRules()}
 function collect(){F.forEach(k=>cfg[k]=$(k).value);B.forEach(k=>cfg[k]=$(k).checked)}
 async function save(){collect();const r=await api('/api/config',cfg);if(r.ok){cfg=r.config;toast('已保存，下次测速生效');drawSrc();drawRules()}else toast(r.error)}
