@@ -373,8 +373,8 @@ def run_once():
     if stop_evt.is_set():
         state.update(status="已停止")
         return
+    state["source_stats"] = stats   # 拉完源立刻显示，可用数在测速过程中实时增加
     if not entries:
-        state["source_stats"] = stats
         state.update(status="没有可用源")
         return
     state.update(status="测速中", total=len(entries))
@@ -391,6 +391,8 @@ def run_once():
         if my == RUN_ID:
             results[i] = r
             state["progress"] += 1
+            if r and r["bitrate"] >= cfg["min_kbps"] and r["speed"] >= r["bitrate"] * cfg["smooth_ratio"]:
+                stats[entries[i][4]]["alive"] += 1
     ex = ThreadPoolExecutor(max(1, int(cfg["workers"])))
     futs = [ex.submit(work, i) for i in range(len(entries))]
     while not stop_evt.is_set() and not all(f.done() for f in futs):
@@ -400,13 +402,11 @@ def run_once():
         state.update(status="已停止")
         log("测速已手动停止，保留上次结果")
         return
-    state["source_stats"] = stats
 
     best, order = {}, []
     for (name, g, logo, url, src), r in zip(entries, results):
         if not r or r["bitrate"] < cfg["min_kbps"] or r["speed"] < r["bitrate"] * cfg["smooth_ratio"]:
             continue
-        stats[src]["alive"] += 1
         k = norm(name, cfg["merge_names"])
         if k not in best:
             best[k] = []
@@ -628,7 +628,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
  <div class=card><h3>订阅地址</h3>
   <div class=row>M3U：<code id=u1></code></div><div class=row>TXT：<code id=u2></code></div>
   <div class=muted>填入播放器即可，测速完成后自动更新内容。</div></div>
- <div class=card><h3>各源情况（上次测速）</h3><table id=sst></table></div>
+ <div class=card><h3>各源情况</h3><table id=sst></table></div>
 </section>
 
 <section id=sources hidden>
