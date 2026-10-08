@@ -1,0 +1,48 @@
+# iptv-speedtest
+
+自研的直播源测速优选服务：定时拉取订阅源 → 逐条测速 → 每个频道只保留**码率最高且能流畅播放**的一条 → 在局域网提供订阅地址。纯 Python 标准库，镜像约 50MB，支持 amd64 / arm64 / armv7 软路由。
+
+## 测速原理
+- **HLS (m3u8)**：主列表选 BANDWIDTH 最高的子流，下载一个完整分片，`码率 = 分片大小 ÷ 分片时长`，`速度 = 分片大小 ÷ 下载用时`
+- **flv / ts 等直连流**：读 5 秒，按平均速率估算码率
+- 下载速度 < 码率 × 1.2 视为会卡，淘汰；mp4 点播占位视频直接丢弃
+- 同名频道（忽略“高清/HD/空格/横杠”）中选码率最高的
+
+## 部署（软路由 / NAS / 任意 Linux）
+```bash
+mkdir -p /opt/iptv-speedtest && cd /opt/iptv-speedtest
+wget https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml
+docker compose up -d --build
+docker logs -f iptv-speedtest     # 看测速进度
+```
+没有 compose 时：
+```bash
+docker build -t iptv-speedtest https://github.com/zknjjjx/iptv.git#main:speedtest
+docker run -d --name iptv-speedtest --restart unless-stopped --network host \
+  -e PORT=8899 -v /opt/iptv-speedtest/data:/data iptv-speedtest
+```
+
+## 使用
+浏览器打开 `http://软路由IP:8899`：
+
+| 地址 | 内容 |
+|---|---|
+| `/m3u` | 优选 M3U 订阅 |
+| `/txt` | 优选 TXT 订阅 |
+| `/report` | 每条的码率、速度、分辨率 |
+| `/status` | 运行状态 |
+| `/refresh` | 立即重新测速 |
+
+## 环境变量
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| SOURCES | 本仓库 iptv.m3u | 订阅源，逗号分隔，支持 m3u/txt |
+| INTERVAL_HOURS | 12 | 重测间隔，0 为只跑一次 |
+| KEEP | 1 | 每频道保留条数 |
+| WORKERS | 32 | 并发数，弱软路由可调 16 |
+| TIMEOUT | 8 | 单次请求超时（秒） |
+| SMOOTH_RATIO | 1.2 | 速度需达到码率的倍数 |
+| MIN_KBPS | 0 | 最低码率 |
+| PORT | 8080 | 服务端口 |
+
+> 软路由若开了代理，请让该容器直连，否则测的是代理线路。
