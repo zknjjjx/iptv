@@ -40,6 +40,8 @@ DEFAULT_CFG = {
     "timeout": float(os.getenv("TIMEOUT", "8")),
     "smooth_ratio": 1.2,
     "min_kbps": 0,
+    "min_height": 0,                # 最低分辨率（高度），0 = 不限
+    "keep_unknown_res": True,       # 测不出分辨率的是否保留
     "ip_version": "all",            # all / ipv4 / ipv6
     "skip_vod": True,               # 丢弃 mp4 等点播占位视频
     "merge_names": True,            # 合并 "CCTV-1 高清" "CCTV1" 这类同名频道
@@ -638,6 +640,20 @@ def probe(url, cfg):
         return F(err_text(e))
 
 
+def res_fail(r, cfg):
+    """分辨率不达标返回原因，否则 None"""
+    mh = int(cfg.get("min_height") or 0)
+    if not mh:
+        return None
+    m = re.match(r"(\d+)x(\d+)", r.get("res") or "")
+    if not m:
+        return None if cfg.get("keep_unknown_res", True) else "分辨率未知"
+    w, h = int(m.group(1)), int(m.group(2))
+    if min(w, h) < mh:
+        return f"分辨率过低 {w}x{h}"
+    return None
+
+
 def run_once():
     with lock:
         cfg = json.loads(json.dumps(CFG))
@@ -691,7 +707,7 @@ def run_once():
             results[i] = r
             state["progress"] += 1
             stats[entries[i][4]]["tested"] += 1
-            if r and "fail" not in r and r["bitrate"] >= cfg["min_kbps"] and r["speed"] >= r["bitrate"] * cfg["smooth_ratio"]:
+            if r and "fail" not in r and r["bitrate"] >= cfg["min_kbps"] and not res_fail(r, cfg) and r["speed"] >= r["bitrate"] * cfg["smooth_ratio"]:
                 stats[entries[i][4]]["alive"] += 1
     ex = ThreadPoolExecutor(max(1, int(cfg["workers"])))
     futs = [ex.submit(work, i) for i in range(len(entries))]
@@ -710,6 +726,10 @@ def run_once():
             continue
         if r["bitrate"] < cfg["min_kbps"]:
             failed.append({"group": g, "name": name, "url": url, "src": src, "reason": f"码率过低 {round(r['bitrate'])}kbps"})
+            continue
+        rf = res_fail(r, cfg)
+        if rf:
+            failed.append({"group": g, "name": name, "url": url, "src": src, "reason": rf})
             continue
         if r["speed"] < r["bitrate"] * cfg["smooth_ratio"]:
             failed.append({"group": g, "name": name, "url": url, "src": src,
@@ -790,16 +810,16 @@ def scheduler():
 def clean_cfg(new):
     c = json.loads(json.dumps(CFG))
     num = {"interval_hours": (0, 168), "keep": (1, 20), "workers": (1, 256),
-           "timeout": (2, 60), "smooth_ratio": (0, 5), "min_kbps": (0, 100000)}
+           "timeout": (2, 60), "smooth_ratio": (0, 5), "min_kbps": (0, 100000), "min_height": (0, 4320)}
     for k, (lo, hi) in num.items():
         if k in new:
             v = float(new[k])
-            c[k] = int(v) if k in ("keep", "workers") else v
+            c[k] = int(v) if k in ("keep", "workers", "min_height") else v
             c[k] = min(max(c[k], lo), hi)
     for k in ("group_mode", "unmatched_group", "blacklist", "ip_version", "epg_url"):
         if k in new:
             c[k] = str(new[k]).strip()
-    for k in ("skip_vod", "merge_names", "run_on_start"):
+    for k in ("skip_vod", "merge_names", "run_on_start", "keep_unknown_res"):
         if k in new:
             c[k] = bool(new[k])
     if "sources" in new:
@@ -968,7 +988,9 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
   <div class=row><label>并发数</label><input type=number id=workers min=1 max=256><span class=muted>软路由弱就调低</span></div>
   <div class=row><label>超时（秒）</label><input type=number id=timeout min=2 max=60></div>
   <div class=row><label>流畅系数</label><input type=number id=smooth_ratio step=0.1 min=0><span class=muted>下载速度 ≥ 码率×此值才保留</span></div>
-  <div class=row><label>最低码率 kbps</label><input type=number id=min_kbps min=0><span class=muted>如 2000 ≈ 只要高清</span></div></div>
+  <div class=row><label>最低码率 kbps</label><input type=number id=min_kbps min=0><span class=muted>如 2000 ≈ 只要高清</span></div>
+  <div class=row><label>最低分辨率</label><select id=min_height><option value=0>不限</option><option value=576>576p（标清）</option><option value=720>720p</option><option value=1080>1080p</option><option value=2160>4K</option></select><span class=muted>低于此分辨率的剔除</span></div>
+  <div class=row><label>分辨率未知时保留</label><input type=checkbox id=keep_unknown_res><span class=muted>有些源测不出分辨率，关掉就一并剔除</span></div></div>
  <div class=card><h3>过滤</h3>
   <div class=row><label>IP 类型</label><select id=ip_version><option value=all>全部</option><option value=ipv4>仅 IPv4</option><option value=ipv6>仅 IPv6</option></select></div>
   <div class=row><label>屏蔽关键词</label><input type=text id=blacklist placeholder="逗号分隔，频道名或链接含有即丢弃"></div>
@@ -998,7 +1020,7 @@ async function api(p,body){const r=await fetch(p,body===undefined?{}:{method:'PO
 document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{tab=a.dataset.t;document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('on',x==a));
  document.querySelectorAll('main section').forEach(s=>s.hidden=s.id!=tab);$('savebar').hidden=!['sources','groups','options'].includes(tab);if(tab=='result')loadResult()});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const F=['interval_hours','keep','workers','timeout','smooth_ratio','min_kbps','ip_version','blacklist','epg_url','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start'];
+const F=['interval_hours','keep','workers','timeout','smooth_ratio','min_kbps','min_height','ip_version','blacklist','epg_url','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start','keep_unknown_res'];
 async function load(){cfg=await api('/api/config');F.forEach(k=>$(k).value=cfg[k]);B.forEach(k=>$(k).checked=cfg[k]);drawSrc();drawRules()}
 function collect(){F.forEach(k=>cfg[k]=$(k).value);B.forEach(k=>cfg[k]=$(k).checked)}
 async function save(){collect();const r=await api('/api/config',cfg);if(r.ok){cfg=r.config;toast('已保存，下次测速生效');drawSrc();drawRules()}else toast(r.error)}
