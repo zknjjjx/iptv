@@ -21,10 +21,12 @@
 ## 部署（软路由 / NAS / 任意 Linux）
 ```bash
 mkdir -p /opt/iptv-speedtest && cd /opt/iptv-speedtest
-wget https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml
-docker compose up -d --build
-docker logs -f iptv-speedtest     # 看测速进度
+wget -O docker-compose.yml https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml
+wget -O app.py https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/app.py
+docker compose up -d
+docker logs -f iptv-speedtest
 ```
+无需构建镜像，不依赖 git / buildx。更新程序：重新下载 app.py 后 `docker restart iptv-speedtest`。
 没有 compose 时：
 ```bash
 docker build -t iptv-speedtest https://github.com/zknjjjx/iptv.git#main:speedtest
