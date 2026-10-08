@@ -7,7 +7,7 @@ iptv-speedtest: 定时拉取直播源 -> 逐条测速 -> 每个频道保留码�
   SOURCES, INTERVAL_HOURS, KEEP, WORKERS, TIMEOUT, PORT, DATA_DIR
   ADMIN_PASSWORD  设置后，修改设置/触发测速需要输入此密码（订阅地址不受影响）
 """
-import ipaddress, json, os, re, socket, threading, time, urllib.request
+import base64, ipaddress, json, os, re, socket, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlparse
@@ -201,6 +201,215 @@ def pick_group(name, orig, cfg):
 
 
 # ---------------- 测速 ----------------
+# ---------------- 分辨率解析（H.264 / H.265 SPS） ----------------
+class _Bits:
+    def __init__(self, b):
+        self.b, self.p = b, 0
+    def u(self, n):
+        v = 0
+        for _ in range(n):
+            byte = self.b[self.p >> 3] if (self.p >> 3) < len(self.b) else 0
+            v = (v << 1) | ((byte >> (7 - (self.p & 7))) & 1)
+            self.p += 1
+        return v
+    def ue(self):
+        z = 0
+        while self.u(1) == 0:
+            z += 1
+            if z > 31:
+                raise ValueError("bad ue")
+        return (1 << z) - 1 + self.u(z)
+    def se(self):
+        v = self.ue()
+        return (v + 1) // 2 if v & 1 else -(v // 2)
+
+
+def _rbsp(b):
+    return b.replace(b"\x00\x00\x03", b"\x00\x00")
+
+
+def _sps264(nal):
+    r = _Bits(_rbsp(nal[1:80]))
+    prof = r.u(8); r.u(16); r.ue()
+    cf = 1
+    if prof in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
+        cf = r.ue()
+        if cf == 3:
+            r.u(1)
+        r.ue(); r.ue(); r.u(1)
+        if r.u(1):
+            for i in range(8 if cf != 3 else 12):
+                if r.u(1):
+                    last = nxt = 8
+                    for _ in range(16 if i < 6 else 64):
+                        if nxt:
+                            nxt = (last + r.se() + 256) % 256
+                        last = nxt or last
+    r.ue()
+    t = r.ue()
+    if t == 0:
+        r.ue()
+    elif t == 1:
+        r.u(1); r.se(); r.se()
+        for _ in range(r.ue()):
+            r.se()
+    r.ue(); r.u(1)
+    w, h = r.ue() + 1, r.ue() + 1
+    fmo = r.u(1)
+    if not fmo:
+        r.u(1)
+    r.u(1)
+    cl = cr = ct = cb = 0
+    if r.u(1):
+        cl, cr, ct, cb = r.ue(), r.ue(), r.ue(), r.ue()
+    sx, sy = (1, 2 - fmo) if cf == 0 else (2 if cf in (1, 2) else 1, (2 if cf == 1 else 1) * (2 - fmo))
+    return w * 16 - sx * (cl + cr), (2 - fmo) * h * 16 - sy * (ct + cb)
+
+
+def _sps265(nal):
+    r = _Bits(_rbsp(nal[2:120]))
+    r.u(4); msl = r.u(3); r.u(1)
+    r.u(96)   # general profile_tier_level (88) + general_level_idc (8)
+    pp, lp = [], []
+    for _ in range(msl):
+        pp.append(r.u(1)); lp.append(r.u(1))
+    if msl > 0:
+        for _ in range(msl, 8):
+            r.u(2)
+    for i in range(msl):
+        if pp[i]:
+            r.u(88)
+        if lp[i]:
+            r.u(8)
+    r.ue()
+    cf = r.ue()
+    if cf == 3:
+        r.u(1)
+    w, h = r.ue(), r.ue()
+    if r.u(1):
+        sx, sy = (2, 2) if cf == 1 else ((2, 1) if cf == 2 else (1, 1))
+        l, rr, t, b = r.ue(), r.ue(), r.ue(), r.ue()
+        w, h = w - sx * (l + rr), h - sy * (t + b)
+    return w, h
+
+
+def _try(nal):
+    out = []
+    if not nal:
+        return out
+    h = nal[0]
+    if h & 0x80:
+        return out
+    try:
+        if h & 0x1F == 7:
+            out.append(_sps264(nal))
+    except Exception:
+        pass
+    try:
+        if (h >> 1) & 0x3F == 33:
+            out.append(_sps265(nal))
+    except Exception:
+        pass
+    return [(w, h2) for w, h2 in out if 64 <= w <= 8192 and 64 <= h2 <= 4320]
+
+
+def _scan_es(es, found):
+    i = es.find(b"\x00\x00\x01")
+    while i != -1 and len(found) < 3:
+        found += _try(es[i + 3:i + 3 + 200])
+        i = es.find(b"\x00\x00\x01", i + 3)
+
+
+def _ts_es(data):
+    """MPEG-TS 去包头，按 PID 拼接负载"""
+    s = data.find(b"\x47")
+    while s != -1 and s + 376 < len(data) and not (data[s + 188] == 0x47 and data[s + 376] == 0x47):
+        s = data.find(b"\x47", s + 1)
+    if s == -1 or s + 376 >= len(data):
+        return None
+    pids = {}
+    for i in range(s, len(data) - 187, 188):
+        pk = data[i:i + 188]
+        if pk[0] != 0x47:
+            continue
+        pid = ((pk[1] & 0x1F) << 8) | pk[2]
+        afc = (pk[3] >> 4) & 3
+        off = 4
+        if afc & 2:
+            off += 1 + pk[4]
+        if afc & 1 and off < 188:
+            pids.setdefault(pid, bytearray()).extend(pk[off:])
+    return [bytes(v) for v in pids.values()]
+
+
+def detect_res(data, sdp=""):
+    found = []
+    try:
+        for b64 in re.findall(r"sprop-parameter-sets=([A-Za-z0-9+/=]+)", sdp or ""):
+            found += _try(base64.b64decode(b64 + "=="))
+        for b64 in re.findall(r"sprop-sps=([A-Za-z0-9+/=]+)", sdp or ""):
+            found += _try(base64.b64decode(b64 + "=="))
+        if not found and data:
+            if data[:3] == b"FLV":
+                for m in re.finditer(rb"\xff\xe1(..)", data[:2000000]):
+                    n = int.from_bytes(m.group(1), "big")
+                    found += _try(data[m.end():m.end() + n])
+                    if found:
+                        break
+            if not found:
+                streams = _ts_es(data)
+                for es in (streams if streams else [data]):
+                    _scan_es(es, found)
+                    if found:
+                        break
+    except Exception:
+        pass
+    if not found:
+        return ""
+    w, h = max(set(found), key=found.count)
+    return f"{w}x{h}"
+
+
+def rtp_payload(raw):
+    """RTSP TCP 交织数据 -> 视频负载（MP2T 原样拼接；H.264/H.265 加起始码）"""
+    out, i = bytearray(), 0
+    while i + 4 <= len(raw):
+        if raw[i] != 0x24:
+            j = raw.find(b"$", i + 1)
+            if j == -1:
+                break
+            i = j
+            continue
+        ch, n = raw[i + 1], int.from_bytes(raw[i + 2:i + 4], "big")
+        pkt = raw[i + 4:i + 4 + n]
+        i += 4 + n
+        if ch != 0 or len(pkt) < 12 or (pkt[0] >> 6) != 2:
+            continue
+        off = 12 + 4 * (pkt[0] & 0x0F)
+        if pkt[0] & 0x10 and len(pkt) >= off + 4:
+            off += 4 + 4 * int.from_bytes(pkt[off + 2:off + 4], "big")
+        pl = pkt[off:]
+        if not pl:
+            continue
+        if pkt[1] & 0x7F == 33:
+            out += pl
+        elif pl[0] & 0x1F == 24:      # H.264 STAP-A
+            k = 1
+            while k + 2 <= len(pl):
+                m = int.from_bytes(pl[k:k + 2], "big")
+                out += b"\x00\x00\x01" + pl[k + 2:k + 2 + m]
+                k += 2 + m
+        elif (pl[0] >> 1) & 0x3F == 48:   # H.265 AP
+            k = 2
+            while k + 2 <= len(pl):
+                m = int.from_bytes(pl[k:k + 2], "big")
+                out += b"\x00\x00\x01" + pl[k + 2:k + 2 + m]
+                k += 2 + m
+        else:
+            out += b"\x00\x00\x01" + pl
+    return bytes(out)
+
+
 def rtsp_probe(url, cfg, seconds=4):
     """RTSP：DESCRIBE -> SETUP(TCP 交织) -> PLAY，接收几秒数据算码率；支持 301/302 跳转"""
     to = min(cfg["timeout"], 8)
@@ -271,6 +480,7 @@ def rtsp_probe(url, cfg, seconds=4):
             if code != 200:
                 return None
             got, t0 = len(buf), time.time()
+            keep = bytearray(buf)
             while time.time() - t0 < seconds and not stop_evt.is_set():
                 sock.settimeout(max(0.5, min(to, seconds - (time.time() - t0))))
                 try:
@@ -280,6 +490,8 @@ def rtsp_probe(url, cfg, seconds=4):
                 if not d:
                     break
                 got += len(d)
+                if len(keep) < 3 * 1024 * 1024:
+                    keep += d
             dt = max(time.time() - t0, 0.5)
             try:
                 sock.sendall(f"TEARDOWN {base} RTSP/1.0\r\nCSeq: 99\r\nSession: {sess}\r\n\r\n".encode())
@@ -291,7 +503,7 @@ def rtsp_probe(url, cfg, seconds=4):
             br = as_kbps or measured
             # 实时流下载速度≈码率；收得上来就视为流畅
             speed = measured * cfg["smooth_ratio"] * 1.01 if measured >= br * 0.85 else measured
-            return {"bitrate": br, "speed": speed, "res": ""}
+            return {"bitrate": br, "speed": speed, "res": detect_res(rtp_payload(bytes(keep)), sdp)}
         finally:
             sock.close()
     return None
@@ -311,7 +523,7 @@ def probe(url, cfg):
             if len(data) < 100 * 1024:
                 return None
             sp = len(data) * 8 / dt / 1000
-            return {"bitrate": sp, "speed": sp * smooth, "res": ""}
+            return {"bitrate": sp, "speed": sp * smooth, "res": detect_res(data[:3 * 1024 * 1024])}
         text = fetch(u, to)[0].decode("utf-8", "ignore")
         res = ""
         for _ in range(2):
@@ -334,7 +546,8 @@ def probe(url, cfg):
         data, dt = fetch(urljoin(u, seg.strip()), to, limit=MAX_SEG)
         if len(data) < 10 * 1024:
             return None
-        return {"bitrate": len(data) * 8 / dur / 1000, "speed": len(data) * 8 / dt / 1000, "res": res}
+        return {"bitrate": len(data) * 8 / dur / 1000, "speed": len(data) * 8 / dt / 1000,
+                "res": res or detect_res(data[:3 * 1024 * 1024])}
     except Exception:
         return None
 
