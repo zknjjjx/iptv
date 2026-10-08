@@ -26,10 +26,11 @@ DEFAULT_CFG = {
                 for u in os.getenv("SOURCES", "https://raw.githubusercontent.com/zknjjjx/iptv/main/iptv.m3u").split(",") if u.strip()],
     "group_mode": "rules",          # rules = 按下面规则分组；source = 保留源里的原始分组
     "group_rules": [
-        {"group": "央视频道", "keywords": "CCTV,CETV,CGTN,央视"},
+        {"group": "央视频道", "keywords": "CCTV,CGTN,央视"},
         {"group": "卫视频道", "keywords": "卫视"},
+        {"group": "科教文卫", "keywords": "CETV,教育,科教,科技,科学,纪实,纪录,求索,探索,地理,发现,DISCOVERY,国学,书画,文化,戏曲,京剧,梨园,健康,卫生,养生,中医,农业,三农"},
         {"group": "港澳台", "keywords": "凤凰,翡翠,TVB,明珠,星空,澳门,台视,中视,华视,民视,东森,中天,三立,纬来"},
-        {"group": "数字付费", "keywords": "剧场,影院,电影,CHC,求索,纪实,风云,兵器,怀旧,文化精品,女性时尚"},
+        {"group": "数字付费", "keywords": "剧场,影院,电影,CHC,风云,兵器,怀旧,女性时尚"},
         {"group": "少儿动画", "keywords": "少儿,卡通,动漫,动画,哈哈,炫动,金鹰卡通,优漫"},
     ],
     "unmatched_group": "地方频道",   # 规则都没匹配上的频道放这里；留空 = 用源里的原始分组
@@ -49,6 +50,8 @@ DEFAULT_CFG = {
     "merge_names": True,            # 合并 "CCTV-1 高清" "CCTV1" 这类同名频道
     "epg_url": "https://live.fanmingming.cn/e.xml",
     "run_on_start": False,          # 容器启动后是否立即测速（默认否，等到点或手动）
+    "proxy": os.getenv("PROXY", ""),
+    "_kjww": True,  # 拉取直播源列表用的代理前缀，如 https://9797.cc.cd/ ；先走代理，失败再直连
 }
 
 lock = threading.Lock()
@@ -83,9 +86,22 @@ def load_cfg():
     cfg = json.loads(json.dumps(DEFAULT_CFG))
     if os.path.exists(CFG_PATH):
         try:
-            cfg.update(json.load(open(CFG_PATH, encoding="utf-8")))
+            saved = json.load(open(CFG_PATH, encoding="utf-8"))
+            cfg.update(saved)
         except Exception as e:
+            saved = {"_kjww": True}
             log("配置文件损坏，使用默认值", e)
+        # 一次性迁移：老配置补上「科教文卫」分组（放在卫视后），CETV 从央视挪过去
+        if not saved.get("_kjww"):
+            cfg["_kjww"] = True
+            rules = cfg.get("group_rules", [])
+            if not any(r.get("group") == "科教文卫" for r in rules):
+                for r in rules:
+                    if r.get("group") == "央视频道":
+                        r["keywords"] = ",".join(k for k in re.split(r"[,，\s]+", r.get("keywords", "")) if k and k != "CETV")
+                pos = next((i + 1 for i, r in enumerate(rules) if r.get("group") == "卫视频道"), len(rules))
+                rules.insert(pos, next(r for r in DEFAULT_CFG["group_rules"] if r["group"] == "科教文卫").copy())
+                cfg["group_rules"] = rules
     return cfg
 
 
@@ -97,8 +113,7 @@ def save_cfg(cfg):
 
 
 CFG = load_cfg()
-if not os.path.exists(CFG_PATH):
-    save_cfg(CFG)
+save_cfg(CFG)   # 首次启动写出默认配置；老配置迁移后也落盘
 
 
 def fetch(url, timeout, limit=None, max_time=None):
@@ -117,8 +132,11 @@ def fetch(url, timeout, limit=None, max_time=None):
 
 
 def source_candidates(url):
-    """源地址 + 备用地址：GitHub 代理前缀失败时直连 raw，再试 jsDelivr 镜像"""
+    """代理 -> 源地址 -> 备用地址（GitHub raw 直连、jsDelivr 镜像）"""
     cands = [url]
+    px = (CFG.get("proxy") or "").strip()
+    if px and url.startswith("http") and not url.startswith(px):
+        cands.insert(0, px.rstrip("/") + "/" + url)
     m = re.search(r"https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)", url)
     if m:
         raw = m.group(0)
@@ -873,7 +891,7 @@ def clean_cfg(new):
             v = float(new[k])
             c[k] = int(v) if k in ("keep", "workers", "min_height", "retest_workers") else v
             c[k] = min(max(c[k], lo), hi)
-    for k in ("group_mode", "unmatched_group", "blacklist", "ip_version", "epg_url"):
+    for k in ("group_mode", "unmatched_group", "blacklist", "ip_version", "epg_url", "proxy"):
         if k in new:
             c[k] = str(new[k]).strip()
     for k in ("skip_vod", "merge_names", "run_on_start", "keep_unknown_res"):
@@ -1014,12 +1032,18 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
   <div id=st></div><div class=bar style="margin:10px 0"><i id=pg style="width:0"></i></div>
   <button id=btnrun onclick=refresh()>立即测速</button> <button id=btnstop class=red onclick=stopRun()>停止测速</button></div>
  <div class=card><h3>订阅地址</h3>
-  <div class=row>M3U：<code id=u1></code></div><div class=row>TXT：<code id=u2></code></div>
+  <div class=row>M3U：<code id=u1></code><button class=gray onclick="copyText($('u1').textContent)">复制</button></div>
+  <div class=row>TXT：<code id=u2></code><button class=gray onclick="copyText($('u2').textContent)">复制</button></div>
   <div class=muted>填入播放器即可，测速完成后自动更新内容。</div></div>
  <div class=card><h3>上次测速情况</h3><div id=lastsum class=muted style="margin-bottom:6px"></div><table id=sst></table></div>
 </section>
 
 <section id=sources hidden>
+ <div class=card><h3>拉取代理</h3>
+  <div class=row><input type=text id=proxy list=pxl placeholder="留空 = 不用代理，如 https://9797.cc.cd/">
+   <button onclick=save()>保存</button></div>
+  <datalist id=pxl><option value="https://9797.cc.cd/"><option value="https://gh-proxy.com/"><option value="https://ghfast.top/"><option value="https://gh.llkk.cc/"></datalist>
+  <div class=muted>只用于拉取源列表：先经代理，失败再直连，再试 jsDelivr 镜像。源地址里已经带了代理前缀的会照原样用。</div></div>
  <div class=card><h3>添加直播源</h3>
   <div class=row><input type=text id=nu placeholder="m3u / txt 订阅地址"></div>
   <div class=row><input type=text id=nn placeholder="备注（可选）"><button onclick=addSrc()>添加</button></div></div>
@@ -1079,7 +1103,7 @@ async function api(p,body){const r=await fetch(p,body===undefined?{}:{method:'PO
 document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{tab=a.dataset.t;document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('on',x==a));
  document.querySelectorAll('main section').forEach(s=>s.hidden=s.id!=tab);$('savebar').hidden=!['sources','groups','options'].includes(tab);if(tab=='result')loadResult()});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const F=['interval_hours','keep','workers','timeout','smooth_ratio','drop_ratio','retest_workers','min_kbps','min_height','ip_version','blacklist','epg_url','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start','keep_unknown_res'];
+const F=['interval_hours','keep','workers','timeout','smooth_ratio','drop_ratio','retest_workers','min_kbps','min_height','ip_version','blacklist','epg_url','proxy','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start','keep_unknown_res'];
 async function load(){cfg=await api('/api/config');F.forEach(k=>$(k).value=cfg[k]);B.forEach(k=>$(k).checked=cfg[k]);drawSrc();drawRules()}
 function collect(){F.forEach(k=>cfg[k]=$(k).value);B.forEach(k=>cfg[k]=$(k).checked)}
 async function save(){collect();const r=await api('/api/config',cfg);if(r.ok){cfg=r.config;toast('已保存，下次测速生效');drawSrc();drawRules()}else toast(r.error)}
@@ -1130,6 +1154,10 @@ function drawResult(){const f=$('rf').value.trim().toUpperCase();
  $('rmore').textContent=rows.length>500?`只显示前 500 条，共 ${rows.length} 条，导出 txt 可拿到全部`:''}
 function exportFail(){const t=failRows().map(x=>`${x.name},${x.url}  # ${x.reason}`).join('\n');
  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/plain'}));a.download='failed.txt';a.click()}
+function copyText(t){const ok=()=>toast('已复制');
+ if(navigator.clipboard&&window.isSecureContext)return navigator.clipboard.writeText(t).then(ok);
+ const a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity=0;document.body.appendChild(a);a.select();
+ try{document.execCommand('copy');ok()}catch(e){prompt('复制下面的地址',t)}a.remove()}
 $('u1').textContent=location.origin+'/m3u';$('u2').textContent=location.origin+'/txt';
 load();status();setInterval(()=>{if(tab=='status')status()},3000);
 </script></html>"""
