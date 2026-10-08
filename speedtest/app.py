@@ -49,7 +49,7 @@ DEFAULT_CFG = {
 lock = threading.Lock()
 state = {"status": "idle", "progress": 0, "total": 0, "last_run": None,
          "channels": 0, "tested": 0, "alive": 0, "duration_s": 0, "next_run": None,
-         "source_stats": {}}
+         "source_stats": {}, "cur_stats": {}}
 refresh_evt = threading.Event()
 stop_evt = threading.Event()
 RUN_ID = 0
@@ -343,7 +343,7 @@ def run_once():
     with lock:
         cfg = json.loads(json.dumps(CFG))
     t0 = time.time()
-    state.update(status="拉取源", progress=0, total=0)
+    state.update(status="拉取源", progress=0, total=0, cur_stats={})
     black = [k for k in re.split(r"[,，\s]+", cfg["blacklist"]) if k]
     entries, seen, stats = [], set(), {}
     for s in cfg["sources"]:
@@ -364,16 +364,16 @@ def run_once():
                 seen.add(key)
                 entries.append((name, g, logo, url, s["url"]))
                 n += 1
-            stats[s["url"]] = {"total": len(items), "used": n, "alive": 0, "error": "",
+            stats[s["url"]] = {"name": s.get("name", ""), "total": len(items), "used": n, "tested": 0, "alive": 0, "error": "",
                                "via": "" if via == s["url"] else via}
             log(f"源 {s['url']}: {len(items)} 条，去重过滤后 {n} 条" + ("" if via == s["url"] else f"（经备用地址 {via}）"))
         except Exception as e:
-            stats[s["url"]] = {"total": 0, "used": 0, "alive": 0, "error": str(e)[:120]}
+            stats[s["url"]] = {"name": s.get("name", ""), "total": 0, "used": 0, "tested": 0, "alive": 0, "error": str(e)[:120]}
             log(f"源拉取失败 {s['url']}: {e}")
     if stop_evt.is_set():
         state.update(status="已停止")
         return
-    state["source_stats"] = stats   # 拉完源立刻显示，可用数在测速过程中实时增加
+    state["cur_stats"] = stats   # 本轮各源：条数/已测/成功，实时更新
     if not entries:
         state.update(status="没有可用源")
         return
@@ -391,6 +391,7 @@ def run_once():
         if my == RUN_ID:
             results[i] = r
             state["progress"] += 1
+            stats[entries[i][4]]["tested"] += 1
             if r and r["bitrate"] >= cfg["min_kbps"] and r["speed"] >= r["bitrate"] * cfg["smooth_ratio"]:
                 stats[entries[i][4]]["alive"] += 1
     ex = ThreadPoolExecutor(max(1, int(cfg["workers"])))
@@ -440,7 +441,7 @@ def run_once():
         tmp = os.path.join(DATA, fn + ".tmp")
         open(tmp, "w", encoding="utf-8").write(body)
         os.replace(tmp, os.path.join(DATA, fn))
-    state.update(status="完成", last_run=time.strftime("%Y-%m-%d %H:%M"), last_ts=time.time(), channels=len(order),
+    state.update(status="完成", source_stats=json.loads(json.dumps(stats)), last_run=time.strftime("%Y-%m-%d %H:%M"), last_ts=time.time(), channels=len(order),
                  tested=len(entries), alive=alive, duration_s=round(time.time() - t0))
     save_state()
     log(f"完成：测试 {len(entries)} 条，可用 {alive} 条，频道 {len(order)} 个，用时 {state['duration_s']}s")
@@ -628,7 +629,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
  <div class=card><h3>订阅地址</h3>
   <div class=row>M3U：<code id=u1></code></div><div class=row>TXT：<code id=u2></code></div>
   <div class=muted>填入播放器即可，测速完成后自动更新内容。</div></div>
- <div class=card><h3>各源情况</h3><table id=sst></table></div>
+ <div class=card><h3>上次测速情况</h3><div id=lastsum class=muted style="margin-bottom:6px"></div><table id=sst></table></div>
 </section>
 
 <section id=sources hidden>
@@ -702,13 +703,17 @@ function drawRules(){$('rules').innerHTML=cfg.group_rules.map((r,i)=>`<div class
  <input type=text value="${esc(r.keywords)}" placeholder="关键词，逗号分隔" onchange="cfg.group_rules[${i}].keywords=this.value">
  <button class=gray onclick=mv(${i},-1)>↑</button><button class=gray onclick=mv(${i},1)>↓</button>
  <button class=red onclick="cfg.group_rules.splice(${i},1);drawRules()">删</button></div>`).join('')}
+function srcTable(st,live){const e=Object.entries(st||{});if(!e.length)return '<tr><td class=muted>暂无</td></tr>';
+ return '<tr><th>源</th><th>条数</th><th>已测</th><th>成功</th></tr>'+e.map(([u,v])=>`<tr><td style="word-break:break-all">${esc(v.name||u)}${v.via?`<div class=muted>经备用：${esc(v.via)}</div>`:''}</td>`+
+ (v.error?`<td colspan=3><span class=bad>拉取失败：${esc(v.error)}</span></td>`:`<td>${v.used}${v.used!=v.total?`<span class=muted>/${v.total}</span>`:''}</td><td>${v.tested??v.used}</td><td class=ok>${v.alive}</td>`)+'</tr>').join('')}
 async function status(){const s=await api('/api/status');const pct=s.total?Math.round(s.progress*100/s.total):0;
- $('st').innerHTML=`状态：<b>${esc(s.status)}</b>${s.total&&s.status=='测速中'?`（${s.progress}/${s.total}）`:''}<br>
- 上次完成：${s.last_run||'-'}，频道 <b>${s.channels}</b> 个，可用 ${s.alive}/${s.tested} 条，用时 ${s.duration_s}s<br>下次自动测速：${s.next_run||'手动'}`;
- const busy=['测速中','拉取源','正在停止'].includes(s.status);const canStop=busy&&s.status!='正在停止';$('btnstop').disabled=!canStop;$('btnstop').style.opacity=canStop?1:.4;$('btnrun').disabled=busy;$('btnrun').style.opacity=busy?.5:1;
- $('pg').style.width=(s.status=='测速中'?pct:(s.last_run?100:0))+'%';
- $('sst').innerHTML='<tr><th>源</th><th>条数</th><th>可用</th></tr>'+Object.entries(s.source_stats||{}).map(([u,v])=>
- `<tr><td style="word-break:break-all">${esc(u)}${v.via?`<div class=muted>经备用：${esc(v.via)}</div>`:''}</td><td>${v.used}/${v.total}</td><td>${v.error?`<span class=bad>${esc(v.error)}</span>`:`<span class=ok>${v.alive}</span>`}</td></tr>`).join('')}
+ const busy=['测速中','拉取源','正在停止'].includes(s.status);
+ $('st').innerHTML=`状态：<b>${esc(s.status)}</b>${s.total&&busy?`（${s.progress}/${s.total}）`:''}　下次自动测速：${s.next_run||'手动'}`+
+  (busy&&Object.keys(s.cur_stats||{}).length?`<table style="margin-top:8px">${srcTable(s.cur_stats)}</table>`:'');
+ const canStop=busy&&s.status!='正在停止';$('btnstop').disabled=!canStop;$('btnstop').style.opacity=canStop?1:.4;$('btnrun').disabled=busy;$('btnrun').style.opacity=busy?.5:1;
+ $('pg').style.width=(busy?pct:(s.last_run?100:0))+'%';
+ $('lastsum').innerHTML=s.last_run?`${s.last_run} 完成，测试 ${s.tested} 条，成功 ${s.alive} 条，保留频道 <b>${s.channels}</b> 个，用时 ${s.duration_s}s`:'还没有完成过测速';
+ $('sst').innerHTML=srcTable(s.source_stats)}
 async function stopRun(){if(!confirm('停止本次测速？订阅保留上次结果'))return;const r=await api('/api/stop',{});toast(r.ok?'正在停止…':r.error);status()}
 async function refresh(){const r=await api('/api/refresh',{});toast(r.ok?'已开始重新测速':r.error);status()}
 async function loadResult(){try{report=await (await fetch('/report')).json()}catch(e){report=[]}drawResult()}
