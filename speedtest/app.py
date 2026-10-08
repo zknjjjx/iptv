@@ -142,6 +142,55 @@ def fetch_source(url, timeout=20):
     raise RuntimeError("；".join(errs[-3:]))
 
 
+def fetch_info(url, timeout, limit=None, max_time=None):
+    """同 fetch，另外返回跳转后的最终地址和 Content-Type"""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    t = time.time()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        final, ctype = r.geturl(), (r.headers.get("Content-Type") or "").lower()
+        buf = bytearray()
+        while True:
+            chunk = r.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            if (limit and len(buf) >= limit) or time.time() - t > (max_time or timeout * 3):
+                break
+    return bytes(buf), max(time.time() - t, 0.001), final, ctype
+
+
+def media_duration(data):
+    """从 TS 的 PCR 或 FLV 标签时间戳算出这段数据的播放时长（秒），算不出返回 0"""
+    try:
+        if data[:3] == b"FLV":
+            i, ts = 13, []
+            while i + 11 <= len(data):
+                size = int.from_bytes(data[i + 1:i + 4], "big")
+                if data[i] in (8, 9):
+                    ts.append(int.from_bytes(data[i + 4:i + 7], "big") | (data[i + 7] << 24))
+                i += 11 + size + 4
+            return (max(ts) - min(ts)) / 1000 if len(ts) > 2 else 0
+        s = data.find(b"\x47")
+        while s != -1 and s + 376 < len(data) and not (data[s + 188] == 0x47 and data[s + 376] == 0x47):
+            s = data.find(b"\x47", s + 1)
+        if s == -1:
+            return 0
+        pcr = {}
+        for i in range(s, len(data) - 187, 188):
+            pk = data[i:i + 188]
+            if pk[0] == 0x47 and (pk[3] & 0x20) and pk[4] >= 7 and (pk[5] & 0x10):
+                pid = ((pk[1] & 0x1F) << 8) | pk[2]
+                v = int.from_bytes(pk[6:11], "big") >> 7
+                pcr.setdefault(pid, []).append(v / 90000)
+        if not pcr:
+            return 0
+        v = max(pcr.values(), key=len)
+        d = v[-1] - v[0]
+        return d if 0 < d < 3600 else 0
+    except Exception:
+        return 0
+
+
 # ---------------- 解析 ----------------
 def parse(text):
     """返回 [(name, group, logo, url)]，兼容 m3u 和 txt"""
@@ -514,17 +563,32 @@ def probe(url, cfg):
     try:
         if u.lower().startswith("rtsp://"):
             return rtsp_probe(u, cfg)
+        if not u.startswith("http"):
+            return None
+        vod = re.compile(r"\.(mp4|mkv|avi|mov)(\?|$)")
+        if cfg["skip_vod"] and vod.search(u.lower()):
+            return None
         if ".m3u8" not in u.lower():
-            if not u.startswith("http"):
-                return None
-            if cfg["skip_vod"] and re.search(r"\.(mp4|mkv|avi|mov)(\?|$)", u.lower()):
-                return None
-            data, dt = fetch(u, to, limit=6 * 1024 * 1024, max_time=5)
-            if len(data) < 100 * 1024:
-                return None
-            sp = len(data) * 8 / dt / 1000
-            return {"bitrate": sp, "speed": sp * smooth, "res": detect_res(data[:3 * 1024 * 1024])}
-        text = fetch(u, to)[0].decode("utf-8", "ignore")
+            data, dt, final, ctype = fetch_info(u, to, limit=6 * 1024 * 1024, max_time=5)
+            if data.lstrip()[:7] == b"#EXTM3U":          # 没有 .m3u8 后缀的 HLS
+                text, u = data.decode("utf-8", "ignore"), final
+            else:
+                # 跳转到 mp4 占位视频（如“盗版提示”）也算无效
+                if cfg["skip_vod"] and (vod.search(final.lower()) or "mp4" in ctype or data[4:8] == b"ftyp"):
+                    return None
+                if len(data) < 100 * 1024:
+                    return None
+                sp = len(data) * 8 / dt / 1000
+                md = media_duration(data)
+                if md:
+                    br = len(data) * 8 / md / 1000
+                    # 直播流服务器按实时速度推送：收到的内容时长跟得上墙钟时间就算流畅
+                    speed = br * smooth * 1.01 if md >= dt * 0.9 else br * md / dt
+                else:
+                    br, speed = sp, sp * smooth
+                return {"bitrate": br, "speed": speed, "res": detect_res(data[:3 * 1024 * 1024])}
+        else:
+            text = fetch(u, to)[0].decode("utf-8", "ignore")
         res = ""
         for _ in range(2):
             if "#EXT-X-STREAM-INF" not in text:
