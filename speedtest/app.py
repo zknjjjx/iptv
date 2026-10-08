@@ -7,7 +7,7 @@ iptv-speedtest: 定时拉取直播源 -> 逐条测速 -> 每个频道保留码�
   SOURCES, INTERVAL_HOURS, KEEP, WORKERS, TIMEOUT, PORT, DATA_DIR
   ADMIN_PASSWORD  设置后，修改设置/触发测速需要输入此密码（订阅地址不受影响）
 """
-import ipaddress, json, os, re, threading, time, urllib.request
+import ipaddress, json, os, re, socket, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urljoin, urlparse
@@ -111,6 +111,37 @@ def fetch(url, timeout, limit=None, max_time=None):
     return bytes(buf), max(time.time() - t, 0.001)
 
 
+def source_candidates(url):
+    """源地址 + 备用地址：GitHub 代理前缀失败时直连 raw，再试 jsDelivr 镜像"""
+    cands = [url]
+    m = re.search(r"https?://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(?:refs/heads/)?([^/]+)/(.+)", url)
+    if m:
+        raw = m.group(0)
+        if raw != url:
+            cands.append(raw)
+        u, r, br, path = m.groups()
+        cands += [f"https://fastly.jsdelivr.net/gh/{u}/{r}@{br}/{path}", f"https://cdn.jsdelivr.net/gh/{u}/{r}@{br}/{path}"]
+    return cands
+
+
+def fetch_source(url, timeout=20):
+    """依次尝试源地址和备用地址，每个重试 2 次。返回 (文本, 实际使用的地址, 用时)"""
+    errs = []
+    for c in source_candidates(url):
+        for _ in range(2):
+            if stop_evt.is_set():
+                raise RuntimeError("已停止")
+            try:
+                data, dt = fetch(c, timeout, max_time=120)
+                text = data.decode("utf-8", "ignore")
+                if len(text) < 50 or text.lstrip().startswith("<"):
+                    raise RuntimeError("内容不是直播源（可能被拦截）")
+                return text, c, dt
+            except Exception as e:
+                errs.append(f"{urlparse(c).hostname}: {str(e)[:60]}")
+    raise RuntimeError("；".join(errs[-3:]))
+
+
 # ---------------- 解析 ----------------
 def parse(text):
     """返回 [(name, group, logo, url)]，兼容 m3u 和 txt"""
@@ -170,9 +201,107 @@ def pick_group(name, orig, cfg):
 
 
 # ---------------- 测速 ----------------
+def rtsp_probe(url, cfg, seconds=4):
+    """RTSP：DESCRIBE -> SETUP(TCP 交织) -> PLAY，接收几秒数据算码率；支持 301/302 跳转"""
+    to = min(cfg["timeout"], 8)
+    for _ in range(4):
+        p = urlparse(url)
+        sock = socket.create_connection((p.hostname, p.port or 554), timeout=to)
+        sock.settimeout(to)
+        buf = bytearray()
+        cseq = [0]
+
+        def req(method, u, extra=""):
+            cseq[0] += 1
+            sock.sendall(f"{method} {u} RTSP/1.0\r\nCSeq: {cseq[0]}\r\nUser-Agent: {UA}\r\n{extra}\r\n".encode())
+            while b"\r\n\r\n" not in buf:
+                # 跳过 PLAY 前后可能出现的交织数据包
+                while buf[:1] == b"$" and len(buf) >= 4 and len(buf) >= 4 + int.from_bytes(buf[2:4], "big"):
+                    del buf[:4 + int.from_bytes(buf[2:4], "big")]
+                if b"\r\n\r\n" in buf:
+                    break
+                d = sock.recv(65536)
+                if not d:
+                    raise ConnectionError("连接被关闭")
+                buf.extend(d)
+            i = buf.index(b"RTSP/") if b"RTSP/" in buf else 0
+            head, _, rest = bytes(buf[i:]).partition(b"\r\n\r\n")
+            lines = head.decode("utf-8", "ignore").split("\r\n")
+            code = int(lines[0].split()[1])
+            hdr = {l.split(":", 1)[0].strip().lower(): l.split(":", 1)[1].strip() for l in lines[1:] if ":" in l}
+            n = int(hdr.get("content-length", 0))
+            while len(rest) < n:
+                d = sock.recv(65536)
+                if not d:
+                    break
+                rest += d
+            buf[:] = rest[n:]
+            return code, hdr, rest[:n].decode("utf-8", "ignore")
+
+        try:
+            code, hdr, sdp = req("DESCRIBE", url, "Accept: application/sdp\r\n")
+            if code in (301, 302, 303, 307) and hdr.get("location"):
+                url = hdr["location"]
+                continue
+            if code != 200:
+                return None
+            base = hdr.get("content-base") or hdr.get("content-location") or url
+            as_kbps, ctrl, in_media = 0, None, False
+            for l in sdp.splitlines():
+                l = l.strip()
+                if l.startswith("m="):
+                    if ctrl is not None:
+                        break
+                    in_media = True
+                elif in_media and l.startswith("b=AS:"):
+                    as_kbps = int(re.sub(r"\D", "", l[5:]) or 0)
+                elif in_media and l.startswith("a=control:"):
+                    ctrl = l[10:]
+            if not ctrl or ctrl == "*":
+                track = base
+            elif ctrl.startswith("rtsp://"):
+                track = ctrl
+            else:
+                track = base.rstrip("/") + "/" + ctrl
+            code, hdr, _ = req("SETUP", track, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
+            if code != 200:
+                return None
+            sess = hdr.get("session", "").split(";")[0]
+            code, hdr, _ = req("PLAY", base, f"Session: {sess}\r\nRange: npt=0.000-\r\n")
+            if code != 200:
+                return None
+            got, t0 = len(buf), time.time()
+            while time.time() - t0 < seconds and not stop_evt.is_set():
+                sock.settimeout(max(0.5, min(to, seconds - (time.time() - t0))))
+                try:
+                    d = sock.recv(65536)
+                except socket.timeout:
+                    break
+                if not d:
+                    break
+                got += len(d)
+            dt = max(time.time() - t0, 0.5)
+            try:
+                sock.sendall(f"TEARDOWN {base} RTSP/1.0\r\nCSeq: 99\r\nSession: {sess}\r\n\r\n".encode())
+            except Exception:
+                pass
+            if got < 50 * 1024:
+                return None
+            measured = got * 8 / dt / 1000
+            br = as_kbps or measured
+            # 实时流下载速度≈码率；收得上来就视为流畅
+            speed = measured * cfg["smooth_ratio"] * 1.01 if measured >= br * 0.85 else measured
+            return {"bitrate": br, "speed": speed, "res": ""}
+        finally:
+            sock.close()
+    return None
+
+
 def probe(url, cfg):
     u, to, smooth = url.split("$")[0], cfg["timeout"], cfg["smooth_ratio"]
     try:
+        if u.lower().startswith("rtsp://"):
+            return rtsp_probe(u, cfg)
         if ".m3u8" not in u.lower():
             if not u.startswith("http"):
                 return None
@@ -223,7 +352,8 @@ def run_once():
         if not s.get("enabled", True):
             continue
         try:
-            items = parse(fetch(s["url"], max(cfg["timeout"] * 3, 30), max_time=180)[0].decode("utf-8", "ignore"))
+            text, via, _ = fetch_source(s["url"])
+            items = parse(text)
             n = 0
             for name, g, logo, url in items:
                 key = url.split("$")[0]
@@ -234,8 +364,9 @@ def run_once():
                 seen.add(key)
                 entries.append((name, g, logo, url, s["url"]))
                 n += 1
-            stats[s["url"]] = {"total": len(items), "used": n, "alive": 0, "error": ""}
-            log(f"源 {s['url']}: {len(items)} 条，去重过滤后 {n} 条")
+            stats[s["url"]] = {"total": len(items), "used": n, "alive": 0, "error": "",
+                               "via": "" if via == s["url"] else via}
+            log(f"源 {s['url']}: {len(items)} 条，去重过滤后 {n} 条" + ("" if via == s["url"] else f"（经备用地址 {via}）"))
         except Exception as e:
             stats[s["url"]] = {"total": 0, "used": 0, "alive": 0, "error": str(e)[:120]}
             log(f"源拉取失败 {s['url']}: {e}")
@@ -299,7 +430,7 @@ def run_once():
         txt.append(f"{g},#genre#")
         for br, name, _, logo, url, r in picks:
             la = f' tvg-logo="{logo}"' if logo else ""
-            m3u += [f'#EXTINF:-1 tvg-name="{name}"{la} group-title="{g}",{name}', url]
+            m3u += [f'#EXTINF:-1 tvg-name="{name}"{la} group-title="{g}",{name}', url.split("$")[0]]
             txt.append(f"{name},{url}")
             report.append({"group": g, "name": name, "url": url, "kbps": round(br),
                            "speed_kbps": round(r["speed"]), "res": r["res"]})
@@ -436,6 +567,19 @@ class H(BaseHTTPRequestHandler):
             refresh_evt.set()
             state["status"] = "拉取源"
             return self._json({"ok": True})
+        if p == "/api/testsource":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                url = json.loads(self.rfile.read(n) or b"{}").get("url", "").strip()
+                text, via, dt = fetch_source(url)
+                items = parse(text)
+                kinds = {}
+                for it in items:
+                    k = it[3].split(":", 1)[0].lower()
+                    kinds[k] = kinds.get(k, 0) + 1
+                return self._json({"ok": True, "count": len(items), "kinds": kinds, "via": via, "seconds": round(dt, 1)})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:300]})
         if p == "/api/stop":
             if state["status"] not in ("测速中", "拉取源"):
                 return self._json({"ok": False, "error": "当前没有在测速"})
@@ -547,7 +691,10 @@ async function save(){collect();const r=await api('/api/config',cfg);if(r.ok){cf
 function drawSrc(){$('srcs').innerHTML=cfg.sources.map((s,i)=>`<div class=item><input type=checkbox ${s.enabled?'checked':''} onchange="cfg.sources[${i}].enabled=this.checked">
  <div style="flex:1;min-width:0"><input type=text value="${esc(s.name)}" placeholder=备注 onchange="cfg.sources[${i}].name=this.value" style="width:100%;margin-bottom:4px">
  <input type=text value="${esc(s.url)}" onchange="cfg.sources[${i}].url=this.value" style="width:100%"></div>
+ <button class=gray onclick="testSrc(${i},this)">测试</button>
  <button class=red onclick="if(confirm('删除这个源？')){cfg.sources.splice(${i},1);drawSrc()}">删</button></div>`).join('')||'<div class=muted>还没有源</div>'}
+async function testSrc(i,b){b.disabled=true;b.textContent='…';const r=await api('/api/testsource',{url:cfg.sources[i].url});b.disabled=false;b.textContent='测试';
+ alert(r.ok?`可用：${r.count} 条（${Object.entries(r.kinds).map(([k,v])=>k+' '+v).join('，')}），用时 ${r.seconds}s`+(r.via!=cfg.sources[i].url?`\n经备用地址：${r.via}`:''):'拉取失败：'+r.error)}
 function addSrc(){const u=$('nu').value.trim();if(!/^https?:\/\//.test(u))return toast('请输入 http(s) 地址');cfg.sources.push({url:u,name:$('nn').value.trim(),enabled:true});$('nu').value=$('nn').value='';drawSrc();toast('已添加，记得保存')}
 function mv(i,d){const r=cfg.group_rules,j=i+d;if(j<0||j>=r.length)return;[r[i],r[j]]=[r[j],r[i]];drawRules()}
 function drawRules(){$('rules').innerHTML=cfg.group_rules.map((r,i)=>`<div class=item>
@@ -561,7 +708,7 @@ async function status(){const s=await api('/api/status');const pct=s.total?Math.
  const busy=['测速中','拉取源','正在停止'].includes(s.status);const canStop=busy&&s.status!='正在停止';$('btnstop').disabled=!canStop;$('btnstop').style.opacity=canStop?1:.4;$('btnrun').disabled=busy;$('btnrun').style.opacity=busy?.5:1;
  $('pg').style.width=(s.status=='测速中'?pct:(s.last_run?100:0))+'%';
  $('sst').innerHTML='<tr><th>源</th><th>条数</th><th>可用</th></tr>'+Object.entries(s.source_stats||{}).map(([u,v])=>
- `<tr><td style="word-break:break-all">${esc(u)}</td><td>${v.used}/${v.total}</td><td>${v.error?`<span class=bad>${esc(v.error)}</span>`:`<span class=ok>${v.alive}</span>`}</td></tr>`).join('')}
+ `<tr><td style="word-break:break-all">${esc(u)}${v.via?`<div class=muted>经备用：${esc(v.via)}</div>`:''}</td><td>${v.used}/${v.total}</td><td>${v.error?`<span class=bad>${esc(v.error)}</span>`:`<span class=ok>${v.alive}</span>`}</td></tr>`).join('')}
 async function stopRun(){if(!confirm('停止本次测速？订阅保留上次结果'))return;const r=await api('/api/stop',{});toast(r.ok?'正在停止…':r.error);status()}
 async function refresh(){const r=await api('/api/refresh',{});toast(r.ok?'已开始重新测速':r.error);status()}
 async function loadResult(){try{report=await (await fetch('/report')).json()}catch(e){report=[]}drawResult()}
