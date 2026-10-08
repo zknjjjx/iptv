@@ -480,7 +480,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
 <section id=status>
  <div class=card><h3>运行状态</h3>
   <div id=st></div><div class=bar style="margin:10px 0"><i id=pg style="width:0"></i></div>
-  <button id=btnrun onclick=refresh()>立即测速</button> <button id=btnstop class=red onclick=stopRun() hidden>停止测速</button></div>
+  <button id=btnrun onclick=refresh()>立即测速</button> <button id=btnstop class=red onclick=stopRun()>停止测速</button></div>
  <div class=card><h3>订阅地址</h3>
   <div class=row>M3U：<code id=u1></code></div><div class=row>TXT：<code id=u2></code></div>
   <div class=muted>填入播放器即可，测速完成后自动更新内容。</div></div>
@@ -558,7 +558,7 @@ function drawRules(){$('rules').innerHTML=cfg.group_rules.map((r,i)=>`<div class
 async function status(){const s=await api('/api/status');const pct=s.total?Math.round(s.progress*100/s.total):0;
  $('st').innerHTML=`状态：<b>${esc(s.status)}</b>${s.total&&s.status=='测速中'?`（${s.progress}/${s.total}）`:''}<br>
  上次完成：${s.last_run||'-'}，频道 <b>${s.channels}</b> 个，可用 ${s.alive}/${s.tested} 条，用时 ${s.duration_s}s<br>下次自动测速：${s.next_run||'手动'}`;
- const busy=['测速中','拉取源','正在停止'].includes(s.status);$('btnstop').hidden=!busy||s.status=='正在停止';$('btnrun').disabled=busy;$('btnrun').style.opacity=busy?.5:1;
+ const busy=['测速中','拉取源','正在停止'].includes(s.status);const canStop=busy&&s.status!='正在停止';$('btnstop').disabled=!canStop;$('btnstop').style.opacity=canStop?1:.4;$('btnrun').disabled=busy;$('btnrun').style.opacity=busy?.5:1;
  $('pg').style.width=(s.status=='测速中'?pct:(s.last_run?100:0))+'%';
  $('sst').innerHTML='<tr><th>源</th><th>条数</th><th>可用</th></tr>'+Object.entries(s.source_stats||{}).map(([u,v])=>
  `<tr><td style="word-break:break-all">${esc(u)}</td><td>${v.used}/${v.total}</td><td>${v.error?`<span class=bad>${esc(v.error)}</span>`:`<span class=ok>${v.alive}</span>`}</td></tr>`).join('')}
