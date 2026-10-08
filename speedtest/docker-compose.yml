@@ -1,0 +1,14 @@
+services:
+  iptv-speedtest:
+    build: https://github.com/zknjjjx/iptv.git#main:speedtest
+    container_name: iptv-speedtest
+    restart: unless-stopped
+    network_mode: host        # 用宿主机网络测速，结果最真实；端口即 PORT
+    environment:
+      - SOURCES=https://raw.githubusercontent.com/zknjjjx/iptv/main/iptv.m3u
+      - INTERVAL_HOURS=12     # 每 12 小时重测
+      - KEEP=1                # 每频道保留 1 条
+      - WORKERS=32            # 并发数，软路由性能弱可改 16
+      - PORT=8899
+    volumes:
+      - ./data:/data
