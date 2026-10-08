@@ -10,7 +10,7 @@ iptv-speedtest: 定时拉取直播源 -> 逐条测速 -> 每个频道保留码�
 import base64, ipaddress, json, os, re, socket, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 PORT = int(os.getenv("PORT", "8080"))
 DATA = os.getenv("DATA_DIR", "/data")
@@ -18,6 +18,7 @@ PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 CFG_PATH = os.path.join(DATA, "config.json")
 UA = "Mozilla/5.0 (iptv-speedtest)"
 MAX_SEG = 8 * 1024 * 1024
+SAFE = ":/?&=%#@+,;~!$'()*[]"   # 链接里的中文等字符转义，其余保持原样
 os.makedirs(DATA, exist_ok=True)
 
 DEFAULT_CFG = {
@@ -97,7 +98,7 @@ if not os.path.exists(CFG_PATH):
 
 
 def fetch(url, timeout, limit=None, max_time=None):
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    req = urllib.request.Request(quote(url, safe=SAFE), headers={"User-Agent": UA})
     t = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
         buf = bytearray()
@@ -144,7 +145,7 @@ def fetch_source(url, timeout=20):
 
 def fetch_info(url, timeout, limit=None, max_time=None):
     """同 fetch，另外返回跳转后的最终地址和 Content-Type"""
-    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    req = urllib.request.Request(quote(url, safe=SAFE), headers={"User-Agent": UA})
     t = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as r:
         final, ctype = r.geturl(), (r.headers.get("Content-Type") or "").lower()
@@ -459,6 +460,27 @@ def rtp_payload(raw):
     return bytes(out)
 
 
+def F(reason):
+    return {"fail": reason}
+
+
+def err_text(e):
+    if hasattr(e, "reason") and not hasattr(e, "code"):
+        e = e.reason if isinstance(e.reason, Exception) else Exception(str(e.reason))
+    t = str(e)
+    if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in t:
+        return "超时"
+    m = re.search(r"HTTP Error (\d+)", t)
+    if m:
+        return f"HTTP {m.group(1)}"
+    for k, v in (("refused", "连接被拒绝"), ("Name or service", "域名解析失败"), ("getaddrinfo", "域名解析失败"),
+                 ("unreachable", "网络不可达"), ("reset", "连接被重置"), ("SSL", "SSL 错误"), ("CERTIFICATE", "证书错误"),
+                 ("连接被关闭", "连接被关闭")):
+        if k in t:
+            return v
+    return t[:60] or type(e).__name__
+
+
 def rtsp_probe(url, cfg, seconds=4):
     """RTSP：DESCRIBE -> SETUP(TCP 交织) -> PLAY，接收几秒数据算码率；支持 301/302 跳转"""
     to = min(cfg["timeout"], 8)
@@ -502,7 +524,7 @@ def rtsp_probe(url, cfg, seconds=4):
                 url = hdr["location"]
                 continue
             if code != 200:
-                return None
+                return F(f"RTSP DESCRIBE 返回 {code}")
             base = hdr.get("content-base") or hdr.get("content-location") or url
             as_kbps, ctrl, in_media = 0, None, False
             for l in sdp.splitlines():
@@ -523,11 +545,11 @@ def rtsp_probe(url, cfg, seconds=4):
                 track = base.rstrip("/") + "/" + ctrl
             code, hdr, _ = req("SETUP", track, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n")
             if code != 200:
-                return None
+                return F(f"RTSP SETUP 返回 {code}")
             sess = hdr.get("session", "").split(";")[0]
             code, hdr, _ = req("PLAY", base, f"Session: {sess}\r\nRange: npt=0.000-\r\n")
             if code != 200:
-                return None
+                return F(f"RTSP PLAY 返回 {code}")
             got, t0 = len(buf), time.time()
             keep = bytearray(buf)
             while time.time() - t0 < seconds and not stop_evt.is_set():
@@ -547,7 +569,7 @@ def rtsp_probe(url, cfg, seconds=4):
             except Exception:
                 pass
             if got < 50 * 1024:
-                return None
+                return F(f"数据太少 {got // 1024}KB")
             measured = got * 8 / dt / 1000
             br = as_kbps or measured
             # 实时流下载速度≈码率；收得上来就视为流畅
@@ -555,7 +577,7 @@ def rtsp_probe(url, cfg, seconds=4):
             return {"bitrate": br, "speed": speed, "res": detect_res(rtp_payload(bytes(keep)), sdp)}
         finally:
             sock.close()
-    return None
+    return F("RTSP 跳转次数过多")
 
 
 def probe(url, cfg):
@@ -564,10 +586,10 @@ def probe(url, cfg):
         if u.lower().startswith("rtsp://"):
             return rtsp_probe(u, cfg)
         if not u.startswith("http"):
-            return None
+            return F("不支持的协议")
         vod = re.compile(r"\.(mp4|mkv|avi|mov)(\?|$)")
         if cfg["skip_vod"] and vod.search(u.lower()):
-            return None
+            return F("点播文件")
         if ".m3u8" not in u.lower():
             data, dt, final, ctype = fetch_info(u, to, limit=6 * 1024 * 1024, max_time=5)
             if data.lstrip()[:7] == b"#EXTM3U":          # 没有 .m3u8 后缀的 HLS
@@ -575,9 +597,9 @@ def probe(url, cfg):
             else:
                 # 跳转到 mp4 占位视频（如“盗版提示”）也算无效
                 if cfg["skip_vod"] and (vod.search(final.lower()) or "mp4" in ctype or data[4:8] == b"ftyp"):
-                    return None
+                    return F("跳转到点播/占位视频")
                 if len(data) < 100 * 1024:
-                    return None
+                    return F(f"数据太少 {len(data) // 1024}KB")
                 sp = len(data) * 8 / dt / 1000
                 md = media_duration(data)
                 if md:
@@ -595,7 +617,7 @@ def probe(url, cfg):
                 break
             vs = re.findall(r"#EXT-X-STREAM-INF:([^\n]*)\n\s*([^\n#]+)", text)
             if not vs:
-                return None
+                return F("m3u8 没有子流")
             bw = lambda v: int((re.search(r"BANDWIDTH=(\d+)", v[0]) or [0, 0])[1])
             attr, sub = max(vs, key=bw)
             m = re.search(r"RESOLUTION=(\d+x\d+)", attr)
@@ -604,16 +626,16 @@ def probe(url, cfg):
             text = fetch(u, to)[0].decode("utf-8", "ignore")
         segs = re.findall(r"#EXTINF:\s*([\d.]+)[^\n]*\n\s*([^\n#]+)", text)
         if not segs:
-            return None
+            return F("m3u8 没有分片")
         dur, seg = segs[-2] if len(segs) > 1 else segs[0]
         dur = float(dur) or 1.0
         data, dt = fetch(urljoin(u, seg.strip()), to, limit=MAX_SEG)
         if len(data) < 10 * 1024:
-            return None
+            return F("分片太小")
         return {"bitrate": len(data) * 8 / dur / 1000, "speed": len(data) * 8 / dt / 1000,
                 "res": res or detect_res(data[:3 * 1024 * 1024])}
-    except Exception:
-        return None
+    except Exception as e:
+        return F(err_text(e))
 
 
 def run_once():
@@ -669,7 +691,7 @@ def run_once():
             results[i] = r
             state["progress"] += 1
             stats[entries[i][4]]["tested"] += 1
-            if r and r["bitrate"] >= cfg["min_kbps"] and r["speed"] >= r["bitrate"] * cfg["smooth_ratio"]:
+            if r and "fail" not in r and r["bitrate"] >= cfg["min_kbps"] and r["speed"] >= r["bitrate"] * cfg["smooth_ratio"]:
                 stats[entries[i][4]]["alive"] += 1
     ex = ThreadPoolExecutor(max(1, int(cfg["workers"])))
     futs = [ex.submit(work, i) for i in range(len(entries))]
@@ -681,9 +703,17 @@ def run_once():
         log("测速已手动停止，保留上次结果")
         return
 
-    best, order = {}, []
+    best, order, failed = {}, [], []
     for (name, g, logo, url, src), r in zip(entries, results):
-        if not r or r["bitrate"] < cfg["min_kbps"] or r["speed"] < r["bitrate"] * cfg["smooth_ratio"]:
+        if not r or "fail" in r:
+            failed.append({"group": g, "name": name, "url": url, "src": src, "reason": (r or {}).get("fail", "未测")})
+            continue
+        if r["bitrate"] < cfg["min_kbps"]:
+            failed.append({"group": g, "name": name, "url": url, "src": src, "reason": f"码率过低 {round(r['bitrate'])}kbps"})
+            continue
+        if r["speed"] < r["bitrate"] * cfg["smooth_ratio"]:
+            failed.append({"group": g, "name": name, "url": url, "src": src,
+                           "reason": f"不流畅 速度{round(r['speed'] / 1000, 1)}/码率{round(r['bitrate'] / 1000, 1)}Mbps"})
             continue
         k = norm(name, cfg["merge_names"])
         if k not in best:
@@ -714,7 +744,8 @@ def run_once():
                            "speed_kbps": round(r["speed"]), "res": r["res"]})
         txt.append("")
     for fn, body in (("best.m3u", "\n".join(m3u) + "\n"), ("best.txt", "\n".join(txt)),
-                     ("report.json", json.dumps(report, ensure_ascii=False))):
+                     ("report.json", json.dumps(report, ensure_ascii=False)),
+                     ("failed.json", json.dumps(failed, ensure_ascii=False))):
         tmp = os.path.join(DATA, fn + ".tmp")
         open(tmp, "w", encoding="utf-8").write(body)
         os.replace(tmp, os.path.join(DATA, fn))
@@ -814,6 +845,8 @@ class H(BaseHTTPRequestHandler):
             return self._file("best.m3u", "audio/x-mpegurl; charset=utf-8")
         if p in ("/txt", "/best.txt"):
             return self._file("best.txt", "text/plain; charset=utf-8")
+        if p in ("/failed", "/api/failed"):
+            return self._file("failed.json", "application/json; charset=utf-8")
         if p in ("/report", "/api/report"):
             return self._file("report.json", "application/json; charset=utf-8")
         if p == "/api/status":
@@ -946,9 +979,12 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
 </section>
 
 <section id=result hidden>
- <div class=card><h3>测速结果 <span class=muted id=rc></span></h3>
-  <div class=row><input type=text id=rf placeholder="搜索频道" oninput=drawResult()></div>
-  <table id=rt></table></div>
+ <div class=card>
+  <div class=row><button id=vok onclick="view='ok';drawResult()">成功</button><button id=vbad onclick="view='bad';drawResult()">失败清单</button>
+   <span class=muted id=rc></span></div>
+  <div class=row><input type=text id=rf placeholder="搜索频道或链接" oninput=drawResult()>
+   <select id=rr onchange=drawResult() hidden></select><button class=gray id=rexp onclick=exportFail() hidden>导出 txt</button></div>
+  <table id=rt></table><div class=muted id=rmore></div></div>
 </section>
 
 <div class=save id=savebar hidden><button class=gray onclick=load()>撤销</button> <button onclick=save()>保存设置</button></div>
@@ -993,10 +1029,26 @@ async function status(){const s=await api('/api/status');const pct=s.total?Math.
  $('sst').innerHTML=srcTable(s.source_stats)}
 async function stopRun(){if(!confirm('停止本次测速？订阅保留上次结果'))return;const r=await api('/api/stop',{});toast(r.ok?'正在停止…':r.error);status()}
 async function refresh(){const r=await api('/api/refresh',{});toast(r.ok?'已开始重新测速':r.error);status()}
-async function loadResult(){try{report=await (await fetch('/report')).json()}catch(e){report=[]}drawResult()}
-function drawResult(){const f=$('rf').value.trim().toUpperCase(),rows=report.filter(r=>!f||r.name.toUpperCase().includes(f));$('rc').textContent=`共 ${report.length} 条`;
- $('rt').innerHTML='<tr><th>分组</th><th>频道</th><th>码率</th><th>分辨率</th></tr>'+rows.slice(0,500).map(r=>
- `<tr><td>${esc(r.group)}</td><td><a href="${esc(r.url)}" target=_blank>${esc(r.name)}</a></td><td>${(r.kbps/1000).toFixed(1)} Mbps</td><td>${esc(r.res)||'-'}</td></tr>`).join('')}
+let failed=[],view='ok';
+async function loadResult(){try{report=await (await fetch('/report')).json()}catch(e){report=[]}
+ try{failed=await (await fetch('/failed')).json()}catch(e){failed=[]}
+ const cnt={};failed.forEach(x=>{const k=x.reason.startsWith('HTTP')?x.reason:x.reason.split(' ')[0];cnt[k]=(cnt[k]||0)+1});
+ $('rr').innerHTML=`<option value="">全部原因（${failed.length}）</option>`+Object.entries(cnt).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<option value="${esc(k)}">${esc(k)}（${v}）</option>`).join('');drawResult()}
+function failRows(){const f=$('rf').value.trim().toUpperCase(),k=$('rr').value;
+ return failed.filter(x=>(!k||x.reason.startsWith(k))&&(!f||x.name.toUpperCase().includes(f)||x.url.toUpperCase().includes(f)))}
+function drawResult(){const f=$('rf').value.trim().toUpperCase();
+ $('vok').className=view=='ok'?'':'gray';$('vbad').className=view=='bad'?'':'gray';$('rr').hidden=$('rexp').hidden=view!='bad';
+ $('rc').textContent=`成功 ${report.length} 条，失败 ${failed.length} 条`;
+ if(view=='ok'){const rows=report.filter(r=>!f||r.name.toUpperCase().includes(f)||r.url.toUpperCase().includes(f));
+  $('rt').innerHTML='<tr><th>分组</th><th>频道</th><th>码率</th><th>分辨率</th></tr>'+rows.slice(0,500).map(r=>
+  `<tr><td>${esc(r.group)}</td><td><a href="${esc(r.url)}" target=_blank>${esc(r.name)}</a></td><td>${(r.kbps/1000).toFixed(1)} Mbps</td><td>${esc(r.res)||'-'}</td></tr>`).join('');
+  $('rmore').textContent=rows.length>500?`只显示前 500 条，共 ${rows.length} 条，可搜索缩小范围`:'';return}
+ const rows=failRows();
+ $('rt').innerHTML='<tr><th>频道</th><th>原因</th><th>链接</th></tr>'+rows.slice(0,500).map(x=>
+  `<tr><td>${esc(x.name)}</td><td class=bad>${esc(x.reason)}</td><td style="word-break:break-all;font-size:12px"><a href="${esc(x.url)}" target=_blank>${esc(x.url)}</a></td></tr>`).join('');
+ $('rmore').textContent=rows.length>500?`只显示前 500 条，共 ${rows.length} 条，导出 txt 可拿到全部`:''}
+function exportFail(){const t=failRows().map(x=>`${x.name},${x.url}  # ${x.reason}`).join('\n');
+ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([t],{type:'text/plain'}));a.download='failed.txt';a.click()}
 $('u1').textContent=location.origin+'/m3u';$('u2').textContent=location.origin+'/txt';
 load();status();setInterval(()=>{if(tab=='status')status()},3000);
 </script></html>"""
