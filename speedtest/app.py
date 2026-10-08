@@ -43,6 +43,7 @@ DEFAULT_CFG = {
     "skip_vod": True,               # 丢弃 mp4 等点播占位视频
     "merge_names": True,            # 合并 "CCTV-1 高清" "CCTV1" 这类同名频道
     "epg_url": "https://live.fanmingming.cn/e.xml",
+    "run_on_start": False,          # 容器启动后是否立即测速（默认否，等到点或手动）
 }
 
 lock = threading.Lock()
@@ -50,6 +51,23 @@ state = {"status": "idle", "progress": 0, "total": 0, "last_run": None,
          "channels": 0, "tested": 0, "alive": 0, "duration_s": 0, "next_run": None,
          "source_stats": {}}
 refresh_evt = threading.Event()
+stop_evt = threading.Event()
+RUN_ID = 0
+STATE_PATH = os.path.join(DATA, "state.json")
+try:
+    state.update({k: v for k, v in json.load(open(STATE_PATH, encoding="utf-8")).items()
+                  if k in ("last_run", "last_ts", "channels", "tested", "alive", "duration_s", "source_stats")})
+except Exception:
+    pass
+state["status"] = "空闲"
+
+
+def save_state():
+    try:
+        json.dump({k: state.get(k) for k in ("last_run", "last_ts", "channels", "tested", "alive", "duration_s", "source_stats")},
+                  open(STATE_PATH, "w", encoding="utf-8"), ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def log(*a):
@@ -200,10 +218,12 @@ def run_once():
     black = [k for k in re.split(r"[,，\s]+", cfg["blacklist"]) if k]
     entries, seen, stats = [], set(), {}
     for s in cfg["sources"]:
+        if stop_evt.is_set():
+            break
         if not s.get("enabled", True):
             continue
         try:
-            items = parse(fetch(s["url"], cfg["timeout"] * 2)[0].decode("utf-8", "ignore"))
+            items = parse(fetch(s["url"], max(cfg["timeout"] * 3, 30), max_time=180)[0].decode("utf-8", "ignore"))
             n = 0
             for name, g, logo, url in items:
                 key = url.split("$")[0]
@@ -219,19 +239,37 @@ def run_once():
         except Exception as e:
             stats[s["url"]] = {"total": 0, "used": 0, "alive": 0, "error": str(e)[:120]}
             log(f"源拉取失败 {s['url']}: {e}")
-    state["source_stats"] = stats
+    if stop_evt.is_set():
+        state.update(status="已停止")
+        return
     if not entries:
+        state["source_stats"] = stats
         state.update(status="没有可用源")
         return
     state.update(status="测速中", total=len(entries))
     log(f"开始测速 {len(entries)} 条，并发 {cfg['workers']}")
 
     results = [None] * len(entries)
+    global RUN_ID
+    RUN_ID += 1
+    my = RUN_ID
     def work(i):
-        results[i] = probe(entries[i][3], cfg)
-        state["progress"] += 1
-    with ThreadPoolExecutor(max(1, int(cfg["workers"]))) as ex:
-        list(ex.map(work, range(len(entries))))
+        if stop_evt.is_set() or my != RUN_ID:
+            return
+        r = probe(entries[i][3], cfg)
+        if my == RUN_ID:
+            results[i] = r
+            state["progress"] += 1
+    ex = ThreadPoolExecutor(max(1, int(cfg["workers"])))
+    futs = [ex.submit(work, i) for i in range(len(entries))]
+    while not stop_evt.is_set() and not all(f.done() for f in futs):
+        time.sleep(0.5)
+    ex.shutdown(wait=not stop_evt.is_set(), cancel_futures=True)
+    if stop_evt.is_set():
+        state.update(status="已停止")
+        log("测速已手动停止，保留上次结果")
+        return
+    state["source_stats"] = stats
 
     best, order = {}, []
     for (name, g, logo, url, src), r in zip(entries, results):
@@ -271,22 +309,41 @@ def run_once():
         tmp = os.path.join(DATA, fn + ".tmp")
         open(tmp, "w", encoding="utf-8").write(body)
         os.replace(tmp, os.path.join(DATA, fn))
-    state.update(status="完成", last_run=time.strftime("%Y-%m-%d %H:%M"), channels=len(order),
+    state.update(status="完成", last_run=time.strftime("%Y-%m-%d %H:%M"), last_ts=time.time(), channels=len(order),
                  tested=len(entries), alive=alive, duration_s=round(time.time() - t0))
+    save_state()
     log(f"完成：测试 {len(entries)} 条，可用 {alive} 条，频道 {len(order)} 个，用时 {state['duration_s']}s")
 
 
+def do_run():
+    stop_evt.clear()
+    try:
+        run_once()
+    except Exception as e:
+        state["status"] = f"出错: {e}"
+        log("运行出错", e)
+    finally:
+        stop_evt.clear()
+
+
 def scheduler():
+    base = time.time()
+    if CFG.get("run_on_start"):
+        do_run()
+        base = time.time()
+    else:
+        log("等待定时或手动触发测速（可在网页“选项”里开启启动即测速）")
     while True:
-        try:
-            run_once()
-        except Exception as e:
-            state["status"] = f"出错: {e}"
-            log("运行出错", e)
         iv = float(CFG.get("interval_hours") or 0)
-        state["next_run"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(time.time() + iv * 3600)) if iv > 0 else None
-        refresh_evt.wait(iv * 3600 if iv > 0 else None)
-        refresh_evt.clear()
+        last = max(state.get("last_ts") or 0, base)
+        nxt = last + iv * 3600 if iv > 0 else None
+        state["next_run"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(nxt)) if nxt else None
+        if refresh_evt.wait(2):
+            refresh_evt.clear()
+        elif not nxt or time.time() < nxt:
+            continue
+        do_run()
+        base = time.time()
 
 
 # ---------------- 配置校验 ----------------
@@ -302,7 +359,7 @@ def clean_cfg(new):
     for k in ("group_mode", "unmatched_group", "blacklist", "ip_version", "epg_url"):
         if k in new:
             c[k] = str(new[k]).strip()
-    for k in ("skip_vod", "merge_names"):
+    for k in ("skip_vod", "merge_names", "run_on_start"):
         if k in new:
             c[k] = bool(new[k])
     if "sources" in new:
@@ -374,9 +431,16 @@ class H(BaseHTTPRequestHandler):
                 save_cfg(CFG)
             return self._json({"ok": True, "config": CFG})
         if p == "/api/refresh":
-            if state["status"] in ("测速中", "拉取源"):
+            if state["status"] in ("测速中", "拉取源", "正在停止"):
                 return self._json({"ok": False, "error": "正在测速，请等待完成"})
             refresh_evt.set()
+            state["status"] = "拉取源"
+            return self._json({"ok": True})
+        if p == "/api/stop":
+            if state["status"] not in ("测速中", "拉取源"):
+                return self._json({"ok": False, "error": "当前没有在测速"})
+            stop_evt.set()
+            state["status"] = "正在停止"
             return self._json({"ok": True})
         self._send(404, "not found")
 
@@ -416,7 +480,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
 <section id=status>
  <div class=card><h3>运行状态</h3>
   <div id=st></div><div class=bar style="margin:10px 0"><i id=pg style="width:0"></i></div>
-  <button onclick=refresh()>立即重新测速</button></div>
+  <button id=btnrun onclick=refresh()>立即测速</button> <button id=btnstop class=red onclick=stopRun() hidden>停止测速</button></div>
  <div class=card><h3>订阅地址</h3>
   <div class=row>M3U：<code id=u1></code></div><div class=row>TXT：<code id=u2></code></div>
   <div class=muted>填入播放器即可，测速完成后自动更新内容。</div></div>
@@ -443,6 +507,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
 
 <section id=options hidden>
  <div class=card><h3>测速</h3>
+  <div class=row><label>启动即测速</label><input type=checkbox id=run_on_start><span class=muted>关闭 = 容器启动后不测，等到点或手动</span></div>
   <div class=row><label>重测间隔（小时）</label><input type=number id=interval_hours step=1 min=0><span class=muted>0 = 只手动</span></div>
   <div class=row><label>每频道保留条数</label><input type=number id=keep min=1 max=20></div>
   <div class=row><label>并发数</label><input type=number id=workers min=1 max=256><span class=muted>软路由弱就调低</span></div>
@@ -475,7 +540,7 @@ async function api(p,body){const r=await fetch(p,body===undefined?{}:{method:'PO
 document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{tab=a.dataset.t;document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('on',x==a));
  document.querySelectorAll('main section').forEach(s=>s.hidden=s.id!=tab);$('savebar').hidden=!['sources','groups','options'].includes(tab);if(tab=='result')loadResult()});
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const F=['interval_hours','keep','workers','timeout','smooth_ratio','min_kbps','ip_version','blacklist','epg_url','group_mode','unmatched_group'],B=['skip_vod','merge_names'];
+const F=['interval_hours','keep','workers','timeout','smooth_ratio','min_kbps','ip_version','blacklist','epg_url','group_mode','unmatched_group'],B=['skip_vod','merge_names','run_on_start'];
 async function load(){cfg=await api('/api/config');F.forEach(k=>$(k).value=cfg[k]);B.forEach(k=>$(k).checked=cfg[k]);drawSrc();drawRules()}
 function collect(){F.forEach(k=>cfg[k]=$(k).value);B.forEach(k=>cfg[k]=$(k).checked)}
 async function save(){collect();const r=await api('/api/config',cfg);if(r.ok){cfg=r.config;toast('已保存，下次测速生效');drawSrc();drawRules()}else toast(r.error)}
@@ -493,9 +558,11 @@ function drawRules(){$('rules').innerHTML=cfg.group_rules.map((r,i)=>`<div class
 async function status(){const s=await api('/api/status');const pct=s.total?Math.round(s.progress*100/s.total):0;
  $('st').innerHTML=`状态：<b>${esc(s.status)}</b>${s.total&&s.status=='测速中'?`（${s.progress}/${s.total}）`:''}<br>
  上次完成：${s.last_run||'-'}，频道 <b>${s.channels}</b> 个，可用 ${s.alive}/${s.tested} 条，用时 ${s.duration_s}s<br>下次自动测速：${s.next_run||'手动'}`;
+ const busy=['测速中','拉取源','正在停止'].includes(s.status);$('btnstop').hidden=!busy||s.status=='正在停止';$('btnrun').disabled=busy;$('btnrun').style.opacity=busy?.5:1;
  $('pg').style.width=(s.status=='测速中'?pct:(s.last_run?100:0))+'%';
  $('sst').innerHTML='<tr><th>源</th><th>条数</th><th>可用</th></tr>'+Object.entries(s.source_stats||{}).map(([u,v])=>
  `<tr><td style="word-break:break-all">${esc(u)}</td><td>${v.used}/${v.total}</td><td>${v.error?`<span class=bad>${esc(v.error)}</span>`:`<span class=ok>${v.alive}</span>`}</td></tr>`).join('')}
+async function stopRun(){if(!confirm('停止本次测速？订阅保留上次结果'))return;const r=await api('/api/stop',{});toast(r.ok?'正在停止…':r.error);status()}
 async function refresh(){const r=await api('/api/refresh',{});toast(r.ok?'已开始重新测速':r.error);status()}
 async function loadResult(){try{report=await (await fetch('/report')).json()}catch(e){report=[]}drawResult()}
 function drawResult(){const f=$('rf').value.trim().toUpperCase(),rows=report.filter(r=>!f||r.name.toUpperCase().includes(f));$('rc').textContent=`共 ${report.length} 条`;
