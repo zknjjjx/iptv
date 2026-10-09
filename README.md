@@ -1,6 +1,6 @@
 # iptv
 
-中国大陆电视直播源合集（已去除重复链接）。
+中国大陆电视直播源合集（已去除重复链接），**每天北京时间 2:00 起每 8 小时自动更新一次**（2:00、10:00、18:00）。
 
 | 文件 | 说明 |
 |---|---|
@@ -22,14 +22,20 @@ docker compose up -d
 ```
 然后打开 `http://软路由IP:8899`。详见 [speedtest/README.md](speedtest/README.md)。
 
-## 来源
+## 来源与自动更新
 汇总自以下公开项目，按链接（去掉 `$` 后缀）去重，央视、卫视单独分组：
-- iptv-org/iptv（cn.m3u）
-- fanmingming/live
-- YueChan/Live
-- Guovin/iptv-api
-- vbskycn/iptv
-- suxuang/myIPTV
+- [Guovin/iptv-api](https://github.com/Guovin/iptv-api)（gd 分支 result.m3u）
+- [YueChan/Live](https://github.com/YueChan/Live)（IPTV.m3u）
+- [fanmingming/live](https://github.com/fanmingming/live)（ipv6.m3u）
+- [iptv-org/iptv](https://github.com/iptv-org/iptv)（cn.m3u）
+- [suxuang/myIPTV](https://github.com/suxuang/myIPTV)（ipv4.m3u）
+- [vbskycn/iptv](https://github.com/vbskycn/iptv)（iptv4.m3u）
+
+更新由 GitHub Actions（[`.github/workflows/update.yml`](.github/workflows/update.yml)）运行 [`scripts/update.py`](scripts/update.py) 完成：
+- 定时：北京时间每天 02:00、10:00、18:00（cron `0 18,2,10 * * *`，UTC）。GitHub 的定时任务高峰期可能推迟几分钟到半小时。
+- 内容没变化就不提交；某个来源拉取失败会跳过，去重后少于 1000 条则放弃本次更新，保留旧文件。
+- 想立即更新：仓库 Actions → 更新直播源 → Run workflow。
+- 本地生成：`python3 scripts/update.py`（只用 Python 标准库）。
 
 ## 说明
 直播源来自网络公开链接，可用性随时变化，部分源仅支持 IPv6。仅供学习交流，请勿用于商业用途。
