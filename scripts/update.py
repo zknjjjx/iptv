@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """拉取各公开直播源，按链接去重，生成 iptv.m3u / iptv.txt。由 GitHub Actions 定时运行。"""
-import re, sys, time, collections, urllib.request
+import re, time, collections, urllib.request
 
 SOURCES = [
     "https://raw.githubusercontent.com/Guovin/iptv-api/gd/output/result.m3u",
@@ -10,7 +10,6 @@ SOURCES = [
     "https://raw.githubusercontent.com/suxuang/myIPTV/main/ipv4.m3u",
     "https://raw.githubusercontent.com/vbskycn/iptv/master/tv/iptv4.m3u",
 ]
-MIN_URLS = 1000   # 结果太少说明拉取出了问题，不覆盖旧文件
 
 
 def fetch(url):
@@ -65,10 +64,9 @@ for src in SOURCES:
         chans.setdefault(name, []).append((g.group(1) if g else "其他", logo.group(1) if logo else "", key))
 
 print(f"成功 {ok}/{len(SOURCES)} 个来源，共 {total} 条，去重后 {len(seen)} 条，{len(chans)} 个频道")
-if len(seen) < MIN_URLS:
-    sys.exit(f"去重后只有 {len(seen)} 条，少于 {MIN_URLS}，不更新")
 
-out = ['#EXTM3U x-tvg-url="https://live.fanmingming.cn/e.xml"']
+now = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
+out = ['#EXTM3U x-tvg-url="https://live.fanmingming.cn/e.xml"', f"# 更新时间（北京时间）{now}"]
 txt = collections.OrderedDict()
 for n, items in chans.items():
     for grp, logo, u in items:
