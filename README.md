@@ -33,7 +33,7 @@ docker compose up -d
 
 更新由 GitHub Actions（[`.github/workflows/update.yml`](.github/workflows/update.yml)）运行 [`scripts/update.py`](scripts/update.py) 完成：
 - 定时：北京时间每天 02:00、10:00、18:00（cron `0 18,2,10 * * *`，UTC）。GitHub 的定时任务高峰期可能推迟几分钟到半小时。
-- 每次运行都会重新生成并提交，无论结果多少、有无变化；`iptv.m3u` 第二行记录本次更新时间。某个来源拉取失败时跳过该来源。
+- 每次运行都会重新生成并提交，无论结果多少、有无变化；两个文件最前面都有「更新时间」分组，播放器里能直接看到本次更新时间。某个来源拉取失败时跳过该来源。
 - 想立即更新：仓库 Actions → 更新直播源 → Run workflow。
 - 本地生成：`python3 scripts/update.py`（只用 Python 标准库）。
 
