@@ -1,6 +1,6 @@
 #EXTM3U x-tvg-url="https://live.fanmingming.cn/e.xml"
-# 更新时间（北京时间）2026-10-10 23:38
-#EXTINF:-1 tvg-name="2026-10-10 23:38 更新" group-title="更新时间",2026-10-10 23:38 更新
+# 更新时间（北京时间）2026-10-11 04:56
+#EXTINF:-1 tvg-name="2026-10-11 04:56 更新" group-title="更新时间",2026-10-11 04:56 更新
 http://38.75.136.137:98/gslb/dsdqbv/cctv1hd.m3u8?auth=test20251009
 #EXTINF:-1 tvg-name="CCTV-1" tvg-logo="https://www.xn--rgv465a.top/tvlogo/CCTV-1.png" group-title="央视频道",CCTV-1
 http://38.75.136.137:98/gslb/dsdqbv/cctv1hd.m3u8?auth=test20251009
