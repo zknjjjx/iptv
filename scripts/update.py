@@ -68,8 +68,17 @@ print(f"成功 {ok}/{len(SOURCES)} 个来源，共 {total} 条，去重后 {len(
 now = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 8 * 3600))
 out = ['#EXTM3U x-tvg-url="https://live.fanmingming.cn/e.xml"', f"# 更新时间（北京时间）{now}"]
 txt = collections.OrderedDict()
+# 置顶「更新时间」分组：播放器里一眼能看到本次更新时间（点开播放 CCTV-1）
+first = next((items for n, items in chans.items() if n.upper().replace("-", "") in ("CCTV1", "CCTV1综合")), None) or next(iter(chans.values()), None)
+if first:
+    stamp = f"{now} 更新"
+    out.append(f'#EXTINF:-1 tvg-name="{stamp}" group-title="更新时间",{stamp}')
+    out.append(first[0][2])
+    txt["更新时间"] = [f"{stamp},{first[0][2]}"]
 for n, items in chans.items():
     for grp, logo, u in items:
+        if "更新时间" in grp or re.match(r"\d{4}-\d{2}-\d{2}", n):
+            continue  # 上游自带的旧「更新时间」条目，去掉免得混淆
         c = cat(n, grp)
         out.append(f'#EXTINF:-1 tvg-name="{n}" tvg-logo="{logo}" group-title="{c}",{n}')
         out.append(u)
