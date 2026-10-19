@@ -68,7 +68,7 @@ DEFAULT_CFG = {
     "epg_url": "https://live.fanmingming.cn/e.xml",
     "run_on_start": False,          # 容器启动后是否立即测速（默认否，等到点或手动）
     "proxy": os.getenv("PROXY", ""),
-    "_kjww": True,  # 拉取直播源列表用的代理前缀，如 https://9797.cc.cd/ ；先走代理，失败再直连
+    "_kjww": True,  # 拉取直播源列表用的代理前缀，如 https://proxy.example.com/ ；先走代理，失败再直连
 }
 
 lock = threading.Lock()
@@ -1112,9 +1112,9 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
 
 <section id=sources hidden>
  <div class=card><h3>拉取代理</h3>
-  <div class=row><input type=text id=proxy list=pxl placeholder="留空 = 不用代理，如 https://9797.cc.cd/">
+  <div class=row><input type=text id=proxy list=pxl placeholder="留空 = 不用代理，如 https://proxy.example.com/">
    <button onclick=save()>保存</button></div>
-  <datalist id=pxl><option value="https://9797.cc.cd/"><option value="https://gh-proxy.com/"><option value="https://ghfast.top/"><option value="https://gh.llkk.cc/"></datalist>
+  <datalist id=pxl><option value="https://proxy.example.com/"><option value="https://gh-proxy.com/"><option value="https://ghfast.top/"><option value="https://gh.llkk.cc/"></datalist>
   <div class=muted>只用于拉取源列表：先经代理，失败再直连，再试 jsDelivr 镜像。源地址里已经带了代理前缀的会照原样用。</div></div>
  <div class=card><h3>添加直播源</h3>
   <div class=row><input type=text id=nu placeholder="m3u / txt 订阅地址"></div>
