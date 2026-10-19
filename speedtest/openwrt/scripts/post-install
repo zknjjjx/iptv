@@ -1,0 +1,7 @@
+#!/bin/sh
+# No service/network restarts on fresh installation; enable explicitly in LuCI.
+umask 077
+mkdir -p /etc/iptv-speedtest
+chmod 700 /etc/iptv-speedtest
+chmod 600 /etc/config/iptv_speedtest
+exit 0

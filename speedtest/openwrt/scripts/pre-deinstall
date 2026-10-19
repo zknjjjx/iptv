@@ -1,0 +1,5 @@
+#!/bin/sh
+# Keep /etc/iptv-speedtest, including playlists/config and password, for rollback.
+/etc/init.d/iptv-speedtest stop
+/etc/init.d/iptv-speedtest disable
+exit 0

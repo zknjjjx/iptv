@@ -14,6 +14,12 @@
 ## 测速优选工具
 直播源很多是失效或卡顿的。[speedtest](speedtest/) 是配套的自研测速服务，部署在软路由 / NAS 上：定时拉取本仓库或任意订阅源，逐条测码率、分辨率和流畅度，每个频道只留最好的一条，在局域网输出 M3U / TXT 订阅，全部设置在网页里完成。
 
+### iStoreOS / OpenWrt 原生插件（新增）
+
+不需要 Docker，支持 procd 服务管理、开机自启和 LuCI 管理入口。已适配斐讯 N1 的 iStoreOS 25.12 APK 包安装，默认低并发且不自动测速；详见 [原生插件安装、构建与回滚说明](speedtest/openwrt/README.md)。
+
+### Docker 部署（原方式保留）
+
 ```bash
 mkdir -p /opt/iptv-speedtest && cd /opt/iptv-speedtest
 wget --no-hsts -T 30 -O docker-compose.yml "https://9797.cc.cd/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml"

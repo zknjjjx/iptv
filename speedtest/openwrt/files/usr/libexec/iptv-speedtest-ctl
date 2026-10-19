@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+[ "$#" -eq 1 ] || exit 2
+case "$1" in
+    apply)
+        if [ "$(uci -q get iptv_speedtest.main.enabled)" = 1 ]; then
+            /etc/init.d/iptv-speedtest enable
+            /etc/init.d/iptv-speedtest restart
+        else
+            /etc/init.d/iptv-speedtest stop
+            /etc/init.d/iptv-speedtest disable
+        fi
+        ;;
+    start|stop|restart) /etc/init.d/iptv-speedtest "$1" ;;
+    *) echo 'Unsupported action' >&2; exit 2 ;;
+esac

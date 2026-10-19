@@ -1,0 +1,13 @@
+{
+  "admin/services/iptv-speedtest": {
+    "title": "IPTV Speedtest",
+    "order": 60,
+    "action": {
+      "type": "view",
+      "path": "iptv-speedtest/config"
+    },
+    "depends": {
+      "acl": [ "luci-app-iptv-speedtest" ]
+    }
+  }
+}
