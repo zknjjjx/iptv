@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+START=95
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    local enabled listen_host port
+    config_load iptv_speedtest
+    config_get_bool enabled main enabled 0
+    [ "$enabled" -eq 1 ] || return 0
+    config_get listen_host main listen_host '127.0.0.1'
+    config_get port main port '8899'
+    # Validate binding before procd respawns; never stop a conflicting process.
+    /usr/bin/python3 -c 'import socket,sys; s=socket.socket(); socket.inet_pton(socket.AF_INET,sys.argv[1]); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((sys.argv[1],int(sys.argv[2]))); s.close()' "$listen_host" "$port" || return 1
+    umask 077
+    mkdir -p /etc/iptv-speedtest
+    chmod 700 /etc/iptv-speedtest
+    if [ ! -s /etc/iptv-speedtest/admin-password ]; then
+        /usr/bin/python3 -c 'import os; print(os.urandom(18).hex())' > /etc/iptv-speedtest/admin-password
+    fi
+    chmod 600 /etc/iptv-speedtest/admin-password
+    procd_open_instance main
+    procd_set_param command /usr/bin/python3 /usr/share/iptv-speedtest/app.py
+    procd_set_param nice 10
+    procd_set_param env LISTEN_HOST="$listen_host" PORT="$port" DATA_DIR=/etc/iptv-speedtest ADMIN_PASSWORD_FILE=/etc/iptv-speedtest/admin-password WORKERS=4 INTERVAL_HOURS=0
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn 3600 5 5
+    procd_close_instance
+}
+
+reload_service() {
+    restart
+}
+
+service_triggers() {
+    procd_add_reload_trigger iptv_speedtest
+}

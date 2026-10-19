@@ -1,0 +1,4 @@
+config iptv_speedtest 'main'
+	option enabled '0'
+	option listen_host '127.0.0.1'
+	option port '8899'

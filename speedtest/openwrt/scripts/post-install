@@ -1,0 +1,10 @@
+#!/bin/sh
+# No service/network restarts on fresh installation; enable explicitly in LuCI.
+umask 077
+mkdir -p /etc/iptv-speedtest
+chmod 700 /etc/iptv-speedtest
+chmod 600 /etc/config/iptv_speedtest
+# Register the fixed LuCI RPC object/ACL without restarting network services.
+[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload
+rm -f /tmp/luci-indexcache.*
+exit 0

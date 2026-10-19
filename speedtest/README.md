@@ -8,7 +8,11 @@
 - 支持 amd64 / arm64 / armv7（斐讯 N1、iStoreOS、OpenWrt、群晖等）
 - 全部设置在网页里完成，保存在 `data/config.json`
 
-## 部署
+## iStoreOS / OpenWrt 原生安装（新增，不依赖 Docker）
+
+提供 APK 安装包构建器、OpenWrt SDK 包定义、procd 服务、UCI 配置和 LuCI 管理入口。N1 / iStoreOS 25.12 实机使用 APK 包管理。默认并发 4、手动测速，不修改网络、DNS 或防火墙。安装、升级及回滚见 [openwrt/README.md](openwrt/README.md)。
+
+## Docker 部署（原方式保留）
 
 ```bash
 mkdir -p /opt/iptv-speedtest && cd /opt/iptv-speedtest
@@ -131,6 +135,8 @@ docker logs --tail 20 iptv-speedtest
 | PROXY | 空 | 拉取代理前缀 |
 | ADMIN_PASSWORD | 空 | 设置后，改设置和触发测速需要密码（订阅地址不受影响） |
 | TZ | Asia/Shanghai | 时区 |
+
+原生服务另外使用 `LISTEN_HOST`（默认空，保持 Docker 原有全接口监听）、`DATA_DIR` 和 `ADMIN_PASSWORD_FILE`。密码文件设置后优先于 `ADMIN_PASSWORD`，文件不存在或为空时启动失败，避免意外无密码运行。设置管理密码时，读取配置、成功/失败详情也需要 `X-Token`；网页自动处理。M3U/TXT 订阅及简要状态接口不要求管理密码。原 Docker 用法不需要改 compose 文件。
 
 ## 常见问题
 
