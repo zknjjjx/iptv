@@ -12,8 +12,8 @@
 
 ```bash
 mkdir -p /opt/iptv-speedtest && cd /opt/iptv-speedtest
-wget --no-hsts -T 30 -O docker-compose.yml "https://9797.cc.cd/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml"
-wget --no-hsts -T 30 -O app.py "https://9797.cc.cd/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/app.py"
+wget --no-hsts -T 30 -O docker-compose.yml "https://proxy.example.com/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml"
+wget --no-hsts -T 30 -O app.py "https://proxy.example.com/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/app.py"
 docker compose up -d
 docker logs --tail 20 iptv-speedtest
 ```
@@ -31,7 +31,7 @@ docker logs --tail 20 iptv-speedtest
 
 ```bash
 cd /opt/iptv-speedtest
-wget --no-hsts -T 30 -O app.py "https://9797.cc.cd/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/app.py"
+wget --no-hsts -T 30 -O app.py "https://proxy.example.com/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/app.py"
 docker restart iptv-speedtest
 docker logs --tail 20 iptv-speedtest
 ```
@@ -109,7 +109,7 @@ docker logs --tail 20 iptv-speedtest
 | 合并同名频道 | 开 | `CCTV-1 高清` = `CCTV1` |
 | EPG 地址 | fanmingming | 写进 M3U 头 |
 
-**拉取代理**（直播源页）：只用于下载订阅源列表，不影响测速。先经代理拉，失败再直连，再试 jsDelivr 镜像。可选：`https://9797.cc.cd/`、`https://gh-proxy.com/`、`https://ghfast.top/`、`https://gh.llkk.cc/`。
+**拉取代理**（直播源页）：只用于下载订阅源列表，不影响测速。先经代理拉，失败再直连，再试 jsDelivr 镜像。可选：`https://proxy.example.com/`、`https://gh-proxy.com/`、`https://ghfast.top/`、`https://gh.llkk.cc/`。
 
 ## 默认分组
 

@@ -7,7 +7,7 @@
 | `iptv.m3u` | M3U 格式，适用于 TiviMate、Kodi、PotPlayer、APTV 等 |
 | `iptv.txt` | TXT 格式（`频道名,链接`，`分组,#genre#`），适用于 DIYP、TVBox 等 |
 
-订阅地址（国内访问慢可在前面加代理，如 `https://9797.cc.cd/`）：
+订阅地址（国内访问慢可在前面加代理，如 `https://proxy.example.com/`）：
 - https://raw.githubusercontent.com/zknjjjx/iptv/main/iptv.m3u
 - https://raw.githubusercontent.com/zknjjjx/iptv/main/iptv.txt
 
@@ -16,8 +16,8 @@
 
 ```bash
 mkdir -p /opt/iptv-speedtest && cd /opt/iptv-speedtest
-wget --no-hsts -T 30 -O docker-compose.yml "https://9797.cc.cd/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml"
-wget --no-hsts -T 30 -O app.py "https://9797.cc.cd/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/app.py"
+wget --no-hsts -T 30 -O docker-compose.yml "https://proxy.example.com/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/docker-compose.yml"
+wget --no-hsts -T 30 -O app.py "https://proxy.example.com/https://raw.githubusercontent.com/zknjjjx/iptv/main/speedtest/app.py"
 docker compose up -d
 ```
 然后打开 `http://软路由IP:8899`。详见 [speedtest/README.md](speedtest/README.md)。
