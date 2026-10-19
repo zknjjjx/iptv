@@ -1,13 +1,38 @@
 {
   "admin/services/iptv-speedtest": {
-    "title": "IPTV Speedtest",
+    "title": "IPTV 测速优选",
     "order": 60,
-    "action": {
-      "type": "view",
-      "path": "iptv-speedtest/config"
-    },
-    "depends": {
-      "acl": [ "luci-app-iptv-speedtest" ]
-    }
+    "action": { "type": "firstchild" },
+    "depends": { "acl": [ "luci-app-iptv-speedtest" ] }
+  },
+  "admin/services/iptv-speedtest/config": {
+    "title": "状态与服务",
+    "order": 10,
+    "action": { "type": "view", "path": "iptv-speedtest/config" },
+    "depends": { "acl": [ "luci-app-iptv-speedtest" ] }
+  },
+  "admin/services/iptv-speedtest/sources": {
+    "title": "直播源",
+    "order": 20,
+    "action": { "type": "view", "path": "iptv-speedtest/sources" },
+    "depends": { "acl": [ "luci-app-iptv-speedtest" ] }
+  },
+  "admin/services/iptv-speedtest/groups": {
+    "title": "分组",
+    "order": 30,
+    "action": { "type": "view", "path": "iptv-speedtest/groups" },
+    "depends": { "acl": [ "luci-app-iptv-speedtest" ] }
+  },
+  "admin/services/iptv-speedtest/options": {
+    "title": "测速选项",
+    "order": 40,
+    "action": { "type": "view", "path": "iptv-speedtest/options" },
+    "depends": { "acl": [ "luci-app-iptv-speedtest" ] }
+  },
+  "admin/services/iptv-speedtest/results": {
+    "title": "测速结果",
+    "order": 50,
+    "action": { "type": "view", "path": "iptv-speedtest/results" },
+    "depends": { "acl": [ "luci-app-iptv-speedtest" ] }
   }
 }

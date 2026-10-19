@@ -2,14 +2,41 @@
   "luci-app-iptv-speedtest": {
     "description": "IPTV speedtest administration",
     "read": {
-      "uci": ["iptv_speedtest"],
-      "ubus": {"service": ["list"], "file": ["read"]},
-      "file": {"/etc/iptv-speedtest/admin-password": ["read"]}
+      "uci": [
+        "iptv_speedtest"
+      ],
+      "ubus": {
+        "iptv-speedtest": [
+          "status",
+          "config",
+          "report",
+          "failed"
+        ],
+        "service": [
+          "list"
+        ]
+      }
     },
     "write": {
-      "uci": ["iptv_speedtest"],
-      "ubus": {"file": ["exec"]},
-      "file": {"/usr/libexec/iptv-speedtest-ctl": ["exec"]}
+      "uci": [
+        "iptv_speedtest"
+      ],
+      "ubus": {
+        "iptv-speedtest": [
+          "save",
+          "testsource",
+          "refresh",
+          "stop"
+        ],
+        "file": [
+          "exec"
+        ]
+      },
+      "file": {
+        "/usr/libexec/iptv-speedtest-ctl": [
+          "exec"
+        ]
+      }
     }
   }
 }

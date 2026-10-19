@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 
 HERE = Path(__file__).resolve().parent
-VERSION = "1.0.0-r3"
+VERSION = "1.0.0-r4"
 NAME = "luci-app-iptv-speedtest"
 DEPENDENCIES = "python3-light python3-urllib python3-openssl python3-logging python3-codecs luci-base rpcd-mod-file"
 

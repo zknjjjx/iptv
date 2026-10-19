@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-iptv-speedtest
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
@@ -35,6 +35,7 @@ define Package/luci-app-iptv-speedtest/install
 	$(INSTALL_DATA) $(CURDIR)/../app.py $(1)/usr/share/iptv-speedtest/app.py
 	chmod 755 $(1)/etc/init.d/iptv-speedtest
 	chmod 755 $(1)/usr/libexec/iptv-speedtest-ctl
+	chmod 755 $(1)/usr/libexec/rpcd/iptv-speedtest
 	chmod 600 $(1)/etc/config/iptv_speedtest
 endef
 
@@ -45,6 +46,11 @@ umask 077
 mkdir -p /etc/iptv-speedtest
 chmod 700 /etc/iptv-speedtest
 chmod 600 /etc/config/iptv_speedtest
+if /etc/init.d/iptv-speedtest enabled; then
+    /etc/init.d/iptv-speedtest restart
+fi
+[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload
+rm -f /tmp/luci-indexcache.*
 exit 0
 endef
 

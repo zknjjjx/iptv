@@ -6,4 +6,7 @@ chmod 600 /etc/config/iptv_speedtest
 if /etc/init.d/iptv-speedtest enabled; then
     /etc/init.d/iptv-speedtest restart
 fi
+# Register the fixed LuCI RPC object/ACL without restarting network services.
+[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload
+rm -f /tmp/luci-indexcache.*
 exit 0
