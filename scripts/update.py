@@ -9,6 +9,9 @@ SOURCES = [
     "https://raw.githubusercontent.com/iptv-org/iptv/master/streams/cn.m3u",
     "https://raw.githubusercontent.com/suxuang/myIPTV/main/ipv4.m3u",
     "https://raw.githubusercontent.com/vbskycn/iptv/master/tv/iptv4.m3u",
+    "https://raw.githubusercontent.com/CCSH/IPTV/main/live.m3u",
+    "https://raw.githubusercontent.com/CCSH/IPTV/main/live_lite.m3u",
+    "https://raw.githubusercontent.com/best-fan/iptv-sources/main/cn_all.m3u8",
 ]
 
 

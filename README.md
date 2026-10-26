@@ -30,6 +30,8 @@ docker compose up -d
 - [iptv-org/iptv](https://github.com/iptv-org/iptv)（cn.m3u）
 - [suxuang/myIPTV](https://github.com/suxuang/myIPTV)（ipv4.m3u）
 - [vbskycn/iptv](https://github.com/vbskycn/iptv)（iptv4.m3u）
+- [CCSH/IPTV](https://github.com/CCSH/IPTV)（live.m3u、live_lite.m3u）
+- [best-fan/iptv-sources](https://github.com/best-fan/iptv-sources)（cn_all.m3u8）
 
 更新由 GitHub Actions（[`.github/workflows/update.yml`](.github/workflows/update.yml)）运行 [`scripts/update.py`](scripts/update.py) 完成：
 - 定时：北京时间每天 02:00、10:00、18:00（cron `0 18,2,10 * * *`，UTC）。GitHub 的定时任务高峰期可能推迟几分钟到半小时。
