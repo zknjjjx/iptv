@@ -30,6 +30,9 @@ docker compose up -d
 - [iptv-org/iptv](https://github.com/iptv-org/iptv)（cn.m3u）
 - [suxuang/myIPTV](https://github.com/suxuang/myIPTV)（ipv4.m3u）
 - [vbskycn/iptv](https://github.com/vbskycn/iptv)（iptv4.m3u）
+- [Free-TV/IPTV](https://github.com/free-tv/iptv)（精选免费频道，见 `sources/free-public.m3u`）
+
+补充清单依据 Free-TV 的免费频道目录精选；仅保留直接 HTTP(S) HLS、且轻量请求返回播放清单的项目，排除地理限制标记、YouTube、点播和含令牌/授权参数的地址。此检查仅验证播放清单可访问，不代表已逐台实播；频道可能随时失效或受地区影响。
 
 更新由 GitHub Actions（[`.github/workflows/update.yml`](.github/workflows/update.yml)）运行 [`scripts/update.py`](scripts/update.py) 完成：
 - 定时：北京时间每天 02:00、10:00、18:00（cron `0 18,2,10 * * *`，UTC）。GitHub 的定时任务高峰期可能推迟几分钟到半小时。
