@@ -7,7 +7,7 @@ iptv-speedtest: 定时拉取直播源 -> 逐条测速 -> 每个频道保留码�
   SOURCES, INTERVAL_HOURS, KEEP, WORKERS, TIMEOUT, PORT, DATA_DIR
   ADMIN_PASSWORD  设置后，修改设置/触发测速需要输入此密码（订阅地址不受影响）
 """
-import base64, ipaddress, json, os, re, socket, threading, time, urllib.request
+import base64, hmac, ipaddress, json, os, re, socket, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urljoin, urlparse
@@ -16,11 +16,21 @@ from urllib.parse import quote, urljoin, urlparse
 _tz = os.environ.get("TZ") or "Asia/Shanghai"
 if "/" in _tz and not os.path.exists("/usr/share/zoneinfo/" + _tz):
     os.environ["TZ"] = {"Asia/Hong_Kong": "HKT-8", "Asia/Tokyo": "JST-9"}.get(_tz, "CST-8")
-    time.tzset()
+    # OpenWrt's small Python build can omit tzset; keep its working localtime.
+    if hasattr(time, "tzset"):
+        time.tzset()
 
 PORT = int(os.getenv("PORT", "8080"))
+LISTEN_HOST = os.getenv("LISTEN_HOST", "")
 DATA = os.getenv("DATA_DIR", "/data")
 PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+if os.getenv("ADMIN_PASSWORD_FILE"):
+    os.umask(0o077)
+    # Fail closed when a configured password file is missing or empty.
+    with open(os.environ["ADMIN_PASSWORD_FILE"], encoding="utf-8") as f:
+        PASSWORD = f.read().strip()
+    if not PASSWORD:
+        raise ValueError("ADMIN_PASSWORD_FILE must contain a non-empty password")
 CFG_PATH = os.path.join(DATA, "config.json")
 UA = "Mozilla/5.0 (iptv-speedtest)"
 MAX_SEG = 8 * 1024 * 1024
@@ -956,13 +966,19 @@ def clean_cfg(new):
 
 
 # ---------------- HTTP ----------------
+def is_busy():
+    status = state["status"]
+    return status in ("测速中", "拉取源", "正在停止") or status.startswith("复测 ")
+
+
 class H(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="text/plain; charset=utf-8"):
         b = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(b)
 
@@ -976,10 +992,13 @@ class H(BaseHTTPRequestHandler):
         self._send(200, open(p, "rb").read(), ctype)
 
     def _authed(self):
-        return not PASSWORD or self.headers.get("X-Token", "") == PASSWORD
+        return not PASSWORD or hmac.compare_digest(
+            self.headers.get("X-Token", "").encode(), PASSWORD.encode())
 
     def do_GET(self):
         p = self.path.split("?")[0].rstrip("/") or "/"
+        if p in ("/api/config", "/failed", "/api/failed", "/report", "/api/report") and not self._authed():
+            return self._json({"ok": False, "error": "密码错误"}, 401)
         if p in ("/m3u", "/best.m3u"):
             return self._file("best.m3u", "audio/x-mpegurl; charset=utf-8")
         if p in ("/txt", "/best.txt"):
@@ -999,6 +1018,15 @@ class H(BaseHTTPRequestHandler):
     def do_POST(self):
         global CFG
         p = self.path.split("?")[0].rstrip("/")
+        origin = self.headers.get("Origin")
+        if origin and urlparse(origin).netloc != self.headers.get("Host", ""):
+            return self._json({"ok": False, "error": "跨站请求已拒绝"}, 403)
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            if size < 0 or size > 1024 * 1024:
+                raise ValueError("body too large")
+        except ValueError:
+            return self._json({"ok": False, "error": "请求体大小无效"}, 413)
         if not self._authed():
             return self._json({"ok": False, "error": "密码错误"}, 401)
         if p == "/api/config":
@@ -1012,7 +1040,7 @@ class H(BaseHTTPRequestHandler):
                 save_cfg(CFG)
             return self._json({"ok": True, "config": CFG})
         if p == "/api/refresh":
-            if state["status"] in ("测速中", "拉取源", "正在停止"):
+            if is_busy():
                 return self._json({"ok": False, "error": "正在测速，请等待完成"})
             refresh_evt.set()
             state["status"] = "拉取源"
@@ -1031,7 +1059,7 @@ class H(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:300]})
         if p == "/api/stop":
-            if state["status"] not in ("测速中", "拉取源"):
+            if not is_busy() or state["status"] == "正在停止":
                 return self._json({"ok": False, "error": "当前没有在测速"})
             stop_evt.set()
             state["status"] = "正在停止"
@@ -1143,7 +1171,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:5px 4px;b
 let cfg={},report=[],tab='status';const $=id=>document.getElementById(id);
 const tok=()=>localStorage.iptvtok||'';
 function toast(t){const e=$('toast');e.textContent=t;e.style.display='block';setTimeout(()=>e.style.display='none',2200)}
-async function api(p,body){const r=await fetch(p,body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok()},body:JSON.stringify(body)});
+async function api(p,body){const r=await fetch(p,body===undefined?{headers:{'X-Token':tok()}}:{method:'POST',headers:{'Content-Type':'application/json','X-Token':tok()},body:JSON.stringify(body)});
  if(r.status==401){const pw=prompt('请输入管理密码');if(pw!==null){localStorage.iptvtok=pw;return api(p,body)}throw 0}return r.json()}
 document.querySelectorAll('nav a').forEach(a=>a.onclick=()=>{tab=a.dataset.t;document.querySelectorAll('nav a').forEach(x=>x.classList.toggle('on',x==a));
  document.querySelectorAll('main section').forEach(s=>s.hidden=s.id!=tab);$('savebar').hidden=!['sources','groups','options'].includes(tab);if(tab=='result')loadResult()});
@@ -1170,7 +1198,7 @@ function srcTable(st,live){const e=Object.entries(st||{});if(!e.length)return '<
  return '<tr><th>源</th><th>条数</th><th>已测</th><th>成功</th></tr>'+e.map(([u,v])=>`<tr><td style="word-break:break-all">${esc(v.name||u)}${v.via?`<div class=muted>经备用：${esc(v.via)}</div>`:''}</td>`+
  (v.error?`<td colspan=3><span class=bad>拉取失败：${esc(v.error)}</span></td>`:`<td>${v.used}${v.used!=v.total?`<span class=muted>/${v.total}</span>`:''}</td><td>${v.tested??v.used}</td><td class=ok>${v.alive}</td>`)+'</tr>').join('')}
 async function status(){const s=await api('/api/status');const pct=s.total?Math.round(s.progress*100/s.total):0;
- const busy=['测速中','拉取源','正在停止'].includes(s.status);
+ const busy=['测速中','拉取源','正在停止'].includes(s.status)||s.status.startsWith('复测 ');
  $('st').innerHTML=`状态：<b>${esc(s.status)}</b>${s.total&&busy?`（${s.progress}/${s.total}）`:''}　下次自动测速：${s.next_run||'手动'}`+
   (busy&&Object.keys(s.cur_stats||{}).length?`<table style="margin-top:8px">${srcTable(s.cur_stats)}</table>`:'');
  const canStop=busy&&s.status!='正在停止';$('btnstop').disabled=!canStop;$('btnstop').style.opacity=canStop?1:.4;$('btnrun').disabled=busy;$('btnrun').style.opacity=busy?.5:1;
@@ -1180,8 +1208,8 @@ async function status(){const s=await api('/api/status');const pct=s.total?Math.
 async function stopRun(){if(!confirm('停止本次测速？订阅保留上次结果'))return;const r=await api('/api/stop',{});toast(r.ok?'正在停止…':r.error);status()}
 async function refresh(){const r=await api('/api/refresh',{});toast(r.ok?'已开始重新测速':r.error);status()}
 let failed=[],view='ok';
-async function loadResult(){try{report=await (await fetch('/report')).json()}catch(e){report=[]}
- try{failed=await (await fetch('/failed')).json()}catch(e){failed=[]}
+async function loadResult(){try{report=await api('/report')}catch(e){report=[]}
+ try{failed=await api('/failed')}catch(e){failed=[]}
  const cnt={};failed.forEach(x=>{const k=x.reason.startsWith('HTTP')?x.reason:x.reason.split(' ')[0];cnt[k]=(cnt[k]||0)+1});
  $('rr').innerHTML=`<option value="">全部原因（${failed.length}）</option>`+Object.entries(cnt).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<option value="${esc(k)}">${esc(k)}（${v}）</option>`).join('');drawResult()}
 function failRows(){const f=$('rf').value.trim().toUpperCase(),k=$('rr').value;
@@ -1211,4 +1239,4 @@ load();status();setInterval(()=>{if(tab=='status')status()},3000);
 if __name__ == "__main__":
     log(f"启动，端口 {PORT}，配置 {CFG_PATH}")
     threading.Thread(target=scheduler, daemon=True).start()
-    ThreadingHTTPServer(("", PORT), H).serve_forever()
+    ThreadingHTTPServer((LISTEN_HOST, PORT), H).serve_forever()
